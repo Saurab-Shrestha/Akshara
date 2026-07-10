@@ -33,13 +33,17 @@ def section(title):
     print(f"\n{'='*60}\n  {title}\n{'='*60}")
 
 
-# ── 1. clone repo ─────────────────────────────────────────────────────────────
+# ── 1. download repo ──────────────────────────────────────────────────────────
 
-section("Cloning Akshara repo")
+section("Downloading Akshara repo")
+# git clone over HTTPS prompts for credentials in non-interactive envs even on
+# public repos. wget the zip instead — simpler and always works.
+ZIP = "/tmp/akshara.zip"
+run(f"wget -q {REPO_URL.replace('.git', '')}/archive/refs/heads/main.zip -O {ZIP}")
+run(f"unzip -q -o {ZIP} -d /tmp/akshara_unzip")
 if os.path.exists(REPO_DIR):
-    run(f"git -C {REPO_DIR} pull --ff-only")
-else:
-    run(f"git clone {REPO_URL} {REPO_DIR}")
+    run(f"rm -rf {REPO_DIR}")
+run(f"mv /tmp/akshara_unzip/Akshara-main {REPO_DIR}")
 
 SRC = REPO_DIR
 sys.path.insert(0, SRC)
