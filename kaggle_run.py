@@ -64,8 +64,22 @@ section("GPU check")
 import torch
 print(f"CUDA available : {torch.cuda.is_available()}")
 if torch.cuda.is_available():
-    print(f"GPU            : {torch.cuda.get_device_name(0)}")
-    print(f"VRAM           : {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+    name = torch.cuda.get_device_name(0)
+    vram = torch.cuda.get_device_properties(0).total_memory / 1e9
+    cc   = torch.cuda.get_device_capability(0)
+    print(f"GPU            : {name}")
+    print(f"VRAM           : {vram:.1f} GB")
+    print(f"Compute cap    : sm_{cc[0]}{cc[1]}")
+    # P100 is sm_60 — PyTorch 2.x dropped support for it.
+    # Switch accelerator to T4 x2 in Kaggle UI: Edit → Session options → Accelerator
+    if cc < (7, 0):
+        raise RuntimeError(
+            f"GPU {name} has compute capability sm_{cc[0]}{cc[1]} — "
+            "PyTorch 2.x requires sm_70+. "
+            "Go to Kaggle UI → Edit → Session options → Accelerator → GPU T4 x2"
+        )
+    for i in range(torch.cuda.device_count()):
+        print(f"  GPU {i}: {torch.cuda.get_device_name(i)}")
 else:
     print("WARNING: no GPU — training will be very slow")
 
