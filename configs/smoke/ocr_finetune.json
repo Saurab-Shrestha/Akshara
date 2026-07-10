@@ -1,0 +1,14 @@
+{
+  "_comment": "Smoke test for OCR fine-tuning. 10 steps, tiny batch, no pretrain ckpt — verifies the VLM training loop runs without error.",
+  "train_path": "/tmp/smoke_ocr_data/data.jsonl",
+  "dev_path": "/tmp/smoke_ocr_data/data.jsonl",
+  "batch_size": 2,
+  "grad_accum": 1,
+  "train_steps": 10,
+  "eval_steps": 5,
+  "eval_iters": 2,
+  "warmup_steps": 2,
+  "lr": 1e-3,
+  "out_ckpt": "/tmp/smoke_ocr.pt",
+  "log_dir": "/tmp/smoke_logs"
+}

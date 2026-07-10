@@ -1,0 +1,18 @@
+{
+  "_comment": "Tiny model for smoke testing. Runs a full forward+backward pass in under 30s on CPU. Overrides the top-level base.json entirely when loaded from configs/smoke/.",
+  "vocab_size": 248077,
+  "n_embed": 128,
+  "n_heads": 4,
+  "n_kv_heads": 2,
+  "n_layers": 4,
+  "max_seq_len": 64,
+  "attn_every": 4,
+  "img_size": 64,
+  "patch_size": 16,
+  "vision_dim": 128,
+  "vit_layers": 2,
+  "vit_heads": 4,
+  "device": "cpu",
+  "amp_dtype": null,
+  "seed": 42
+}

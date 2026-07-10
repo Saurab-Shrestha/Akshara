@@ -1,0 +1,24 @@
+# Core
+torch>=2.3.0
+torchvision>=0.18.0
+
+# Tokenizer + model hub
+transformers>=4.45.0
+huggingface-hub>=0.24.0
+sentencepiece>=0.2.0
+tiktoken>=0.7.0
+
+# Data
+datasets>=2.20.0
+Pillow>=10.0.0
+numpy>=1.26.0
+
+# Synthetic data rendering
+Faker>=25.0.0
+
+# Training utilities
+tqdm>=4.66.0
+tensorboard>=2.17.0
+
+# Dev
+ipykernel>=6.29.0

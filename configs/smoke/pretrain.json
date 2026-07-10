@@ -1,0 +1,14 @@
+{
+  "_comment": "Smoke test for language pretraining. 10 steps, tiny batch — verifies the training loop runs without error.",
+  "train_path": "data/corpus/train.jsonl",
+  "dev_path": "data/corpus/val.jsonl",
+  "batch_size": 2,
+  "grad_accum": 1,
+  "train_steps": 10,
+  "eval_steps": 5,
+  "eval_iters": 2,
+  "warmup_steps": 2,
+  "lr": 1e-3,
+  "out_ckpt": "/tmp/smoke_pretrain.pt",
+  "log_dir": "/tmp/smoke_logs"
+}

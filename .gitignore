@@ -1,0 +1,61 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Environments
+venv/
+.venv/
+env/
+.env
+
+# Checkpoints & model weights
+checkpoints/
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.gguf
+*.onnx
+
+# Training data (large, downloaded on the fly)
+data/corpus/
+data/synthetic/
+data/documents/
+data/hf_cache/
+
+# Logs & tensorboard
+logs/
+runs/
+*.log
+events.out.tfevents.*
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Kaggle
+__results__.html
+__notebook__.ipynb
+
+# Misc
+*.tmp
+*.bak

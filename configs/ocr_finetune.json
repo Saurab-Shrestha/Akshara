@@ -1,0 +1,15 @@
+{
+  "_comment": "Stage-specific overrides for OCR fine-tuning (vision+text). Loads pretrained decoder weights from pretrain_ckpt.",
+  "train_path": "data/documents/train.jsonl",
+  "dev_path": "data/documents/val.jsonl",
+  "batch_size": 2,
+  "grad_accum": 16,
+  "train_steps": 20000,
+  "eval_steps": 250,
+  "warmup_steps": 500,
+  "lr": 1e-4,
+  "min_lr": 1e-5,
+  "pretrain_ckpt": "checkpoints/pretrain.pt",
+  "out_ckpt": "checkpoints/ocr.pt",
+  "log_dir": "logs/ocr"
+}

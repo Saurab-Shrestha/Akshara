@@ -1,0 +1,18 @@
+{
+  "_comment": "Shared model architecture + runtime fields for all training stages. Override per-stage in pretrain.json / ocr_finetune.json.",
+  "vocab_size": 248077,
+  "n_embed": 768,
+  "n_heads": 12,
+  "n_kv_heads": 3,
+  "n_layers": 12,
+  "max_seq_len": 2048,
+  "attn_every": 4,
+  "img_size": 448,
+  "patch_size": 16,
+  "vision_dim": 384,
+  "vit_layers": 12,
+  "vit_heads": 6,
+  "device": "cuda",
+  "amp_dtype": "bf16",
+  "seed": 42
+}
