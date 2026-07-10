@@ -314,7 +314,7 @@ def main() -> None:
             print(f"  [ckpt] saved → {cfg.out_ckpt} (step {step})")
 
     # --- final checkpoint ---
-    save_checkpoint(cfg.out_ckpt, model, optimizer, cfg.train_steps, cfg)
+    save_checkpoint(cfg.out_ckpt, raw_model, optimizer, cfg.train_steps, cfg)
     writer.close()
     print(f"[pretrain] done. Final checkpoint → {cfg.out_ckpt}")
 
