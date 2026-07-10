@@ -6,7 +6,6 @@
   "kernel_type": "script",
   "is_private": true,
   "enable_gpu": true,
-  "accelerator": "nvidiaTeslaT4x2",
   "enable_internet": true,
   "dataset_sources": [],
   "competition_sources": [],

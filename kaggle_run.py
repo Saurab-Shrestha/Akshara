@@ -53,8 +53,10 @@ print(f"SRC : {SRC}")
 # ── 2. dependencies ───────────────────────────────────────────────────────────
 
 section("Installing dependencies")
-run(f"pip install -q -r {SRC}/requirements.txt --no-deps "
-    "--ignore-installed torch torchvision torchaudio")
+# Skip torch/torchvision — Kaggle's pre-installed build is already CUDA-compatible.
+# Reinstalling from PyPI would overwrite it with a CPU or incompatible CUDA build.
+run(f"grep -vE '^torch|^torchvision|^torchaudio' {SRC}/requirements.txt "
+    f"| pip install -q -r /dev/stdin")
 
 # ── 3. verify GPU ─────────────────────────────────────────────────────────────
 
