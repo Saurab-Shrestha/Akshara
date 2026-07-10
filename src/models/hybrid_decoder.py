@@ -191,7 +191,14 @@ class HybridDecoder(nn.Module):
 
         for layer in self.layers:
             if self.gradient_checkpointing and self.training:
-                x = ckpt.checkpoint(layer, x, freqs_cis, use_reentrant=False)
+                # freqs_cis is complex — passing it as a ckpt.checkpoint positional arg
+                # causes shape corruption with use_reentrant=False. Capture via closure
+                # so only x (the real-valued activation) goes through checkpoint.
+                def _make_fwd(l, fc):
+                    def _inner(inp):
+                        return l(inp, fc)
+                    return _inner
+                x = ckpt.checkpoint(_make_fwd(layer, freqs_cis), x, use_reentrant=False)
             else:
                 # Both GDNBlock and TransformerBlock accept freqs_cis
                 # GDNBlock ignores it; TransformerBlock uses it for RoPE
