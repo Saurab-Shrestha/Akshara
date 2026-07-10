@@ -194,7 +194,7 @@ def main() -> None:
     n_params = sum(p.numel() for p in model.parameters())
     print(f"[pretrain] model params: {n_params:,} (~{n_params / 1e6:.1f}M)")
 
-    # --- optional resume ---
+    # --- optional resume (load before DataParallel so keys match) ---
     start_step = 0
     if args.resume and os.path.exists(args.resume):
         ck = torch.load(args.resume, map_location="cpu", weights_only=False)
@@ -202,8 +202,8 @@ def main() -> None:
         start_step = ck.get("step", 0)
         print(f"[pretrain] resumed from {args.resume} at step {start_step}")
 
-    # --- optimizer: separate weight-decay groups (no decay on biases / norms) ---
-    decay_params  = [p for n, p in model.named_parameters() if p.requires_grad and p.dim() >= 2]
+    # --- optimizer: build before DataParallel (references same param tensors) ---
+    decay_params   = [p for n, p in model.named_parameters() if p.requires_grad and p.dim() >= 2]
     nodecay_params = [p for n, p in model.named_parameters() if p.requires_grad and p.dim() < 2]
     optimizer = torch.optim.AdamW([
         {"params": decay_params,   "weight_decay": cfg.weight_decay},
@@ -214,6 +214,14 @@ def main() -> None:
         ck = torch.load(args.resume, map_location="cpu", weights_only=False)
         if "optimizer_state_dict" in ck:
             optimizer.load_state_dict(ck["optimizer_state_dict"])
+
+    # --- multi-GPU: wrap in DataParallel if multiple GPUs available ---
+    n_gpus = torch.cuda.device_count() if device == "cuda" else 0
+    if n_gpus > 1:
+        print(f"[pretrain] {n_gpus}× GPU detected — using DataParallel (effective batch ×{n_gpus})")
+        model = nn.DataParallel(model)
+    # raw_model: always the unwrapped model (for state_dict saving)
+    raw_model = model.module if isinstance(model, nn.DataParallel) else model
 
     # --- data ---
     train_loader = get_text_dataloader(
@@ -302,7 +310,7 @@ def main() -> None:
 
         # --- periodic checkpoint ---
         if step > start_step and step % cfg.save_every == 0:
-            save_checkpoint(cfg.out_ckpt, model, optimizer, step, cfg)
+            save_checkpoint(cfg.out_ckpt, raw_model, optimizer, step, cfg)
             print(f"  [ckpt] saved → {cfg.out_ckpt} (step {step})")
 
     # --- final checkpoint ---

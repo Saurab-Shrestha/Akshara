@@ -263,7 +263,7 @@ def main() -> None:
     n_params = sum(p.numel() for p in model.parameters())
     print(f"[train_ocr] total params: {n_params:,} (~{n_params / 1e6:.1f}M)")
 
-    # --- optional resume (full VLM checkpoint) ---
+    # --- optional resume (load before DataParallel so keys match) ---
     start_step = 0
     if args.resume and os.path.exists(args.resume):
         ck = torch.load(args.resume, map_location="cpu", weights_only=False)
@@ -284,6 +284,13 @@ def main() -> None:
         if "optimizer_state_dict" in ck:
             optimizer.load_state_dict(ck["optimizer_state_dict"])
 
+    # --- multi-GPU ---
+    n_gpus = torch.cuda.device_count() if device == "cuda" else 0
+    if n_gpus > 1:
+        print(f"[train_ocr] {n_gpus}× GPU detected — using DataParallel (effective batch ×{n_gpus})")
+        model = nn.DataParallel(model)
+    raw_model = model.module if isinstance(model, nn.DataParallel) else model
+
     # --- data ---
     train_loader = get_ocr_dataloader(
         cfg.train_path, tokenizer, cfg.batch_size, cfg.img_size, cfg.max_seq_len, shuffle=True
@@ -301,7 +308,7 @@ def main() -> None:
     UNFREEZE_AT = 1000
     encoder_frozen = False
     if start_step < UNFREEZE_AT:
-        model.freeze_encoder()
+        raw_model.freeze_encoder()
         encoder_frozen = True
         print(f"[train_ocr] vision encoder FROZEN until step {UNFREEZE_AT}")
 
@@ -316,7 +323,7 @@ def main() -> None:
 
         # Phase 2 transition: unfreeze encoder after 1000 steps.
         if encoder_frozen and step >= UNFREEZE_AT:
-            model.unfreeze_all()
+            raw_model.unfreeze_all()
             encoder_frozen = False
             print(f"[train_ocr] vision encoder UNFROZEN at step {step}")
 
@@ -374,10 +381,10 @@ def main() -> None:
             writer.add_scalar("eval/cer", cer, step)
 
         if step > start_step and step % cfg.save_every == 0:
-            save_checkpoint(cfg.out_ckpt, model, optimizer, step, cfg)
+            save_checkpoint(cfg.out_ckpt, raw_model, optimizer, step, cfg)
             print(f"  [ckpt] saved → {cfg.out_ckpt} (step {step})")
 
-    save_checkpoint(cfg.out_ckpt, model, optimizer, cfg.train_steps, cfg)
+    save_checkpoint(cfg.out_ckpt, raw_model, optimizer, cfg.train_steps, cfg)
     writer.close()
     print(f"[train_ocr] done. Final checkpoint → {cfg.out_ckpt}")
 
