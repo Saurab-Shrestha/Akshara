@@ -77,7 +77,8 @@ class TextDataset(Dataset):
         text = self.texts[idx]
         # encode returns a plain list[int]; prepend BOS so the model learns to
         # start a document from scratch (important for generation at inference time).
-        ids = [self.tokenizer.bos_token_id] + self.tokenizer.encode(text)
+        bos = self.tokenizer.bos_token_id or self.tokenizer.eos_token_id
+        ids = [bos] + self.tokenizer.encode(text)
 
         # Truncate to max_seq_len + 1 so we can shift to get both input and target.
         ids = ids[: self.max_seq_len + 1]
