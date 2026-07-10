@@ -293,6 +293,8 @@ def main() -> None:
     ) if os.path.exists(cfg.dev_path) else None
 
     os.makedirs(cfg.log_dir, exist_ok=True)
+    from torch.utils.tensorboard import SummaryWriter
+    writer = SummaryWriter(log_dir=cfg.log_dir)
     train_iter = iter(train_loader)
 
     # Phase 1: freeze the vision encoder for the first 1000 steps.
@@ -305,8 +307,9 @@ def main() -> None:
 
     # --- training loop ---
     model.train()
-    t0 = time.perf_counter()
-    accum_loss = 0.0
+    t0          = time.perf_counter()
+    run_start   = time.perf_counter()
+    accum_loss  = 0.0
     tokens_per_step = cfg.batch_size * cfg.max_seq_len * cfg.grad_accum
 
     for step in range(start_step, cfg.train_steps):
@@ -342,24 +345,40 @@ def main() -> None:
             loss.backward()
             accum_loss += loss.item()
 
-        torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
         optimizer.step()
 
         if step % 20 == 0:
-            dt = time.perf_counter() - t0
+            dt    = time.perf_counter() - t0
             tok_s = tokens_per_step * 20 / dt if step > start_step else 0.0
-            t0 = time.perf_counter()
-            print(f"step {step:>6d} | loss {accum_loss:.4f} | lr {lr:.2e} | {tok_s:,.0f} tok/s")
+            t0    = time.perf_counter()
+
+            steps_done    = max(1, step - start_step)
+            elapsed       = time.perf_counter() - run_start
+            secs_per_step = elapsed / steps_done
+            eta_secs      = (cfg.train_steps - step) * secs_per_step
+            eta_str       = f"{eta_secs/3600:.1f}h" if eta_secs > 3600 else f"{eta_secs/60:.0f}m"
+
+            print(f"step {step:>6d} | loss {accum_loss:.4f} | lr {lr:.2e} | "
+                  f"gnorm {grad_norm:.2f} | {tok_s:,.0f} tok/s | "
+                  f"elapsed {elapsed/3600:.1f}h | eta {eta_str}")
+
+            writer.add_scalar("train/loss",       accum_loss,       step)
+            writer.add_scalar("train/lr",          lr,               step)
+            writer.add_scalar("train/grad_norm",   grad_norm.item(), step)
+            writer.add_scalar("train/tok_per_sec", tok_s,            step)
 
         if step > start_step and step % cfg.eval_steps == 0 and dev_loader is not None:
             cer = evaluate_cer(model, dev_loader, tokenizer, cfg, cfg.eval_iters)
             print(f"  [eval] step {step} | CER {cer:.4f} ({cer * 100:.2f}%)")
+            writer.add_scalar("eval/cer", cer, step)
 
         if step > start_step and step % cfg.save_every == 0:
             save_checkpoint(cfg.out_ckpt, model, optimizer, step, cfg)
             print(f"  [ckpt] saved → {cfg.out_ckpt} (step {step})")
 
     save_checkpoint(cfg.out_ckpt, model, optimizer, cfg.train_steps, cfg)
+    writer.close()
     print(f"[train_ocr] done. Final checkpoint → {cfg.out_ckpt}")
 
 
