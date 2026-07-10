@@ -112,11 +112,12 @@ class MultiHeadAttention(nn.Module):
         mask = torch.tril(torch.ones(_mask_len, _mask_len, dtype=torch.bool))
         self.register_buffer("causal_mask", mask)
 
-    def forward(self, x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            x:          (batch, seq_len, n_embed)
-            freqs_cis:  (seq_len, head_dim // 2) — precomputed RoPE factors
+            x:   (batch, seq_len, n_embed)
+            cos: (seq_len, head_dim // 2) — RoPE cosine table
+            sin: (seq_len, head_dim // 2) — RoPE sine table
 
         Returns:
             (batch, seq_len, n_embed)
@@ -134,8 +135,8 @@ class MultiHeadAttention(nn.Module):
         v = v.view(B, T, self.n_kv_heads, self.head_dim)
 
         # ── Apply RoPE to Q and K (not V — V carries content, not position) ─
-        q = apply_rope(q, freqs_cis)
-        k = apply_rope(k, freqs_cis)
+        q = apply_rope(q, cos, sin)
+        k = apply_rope(k, cos, sin)
 
         # ── Expand K and V for GQA ──────────────────────────────────────────
         # Each KV head needs to be repeated n_rep times to match query heads
@@ -181,10 +182,10 @@ if __name__ == "__main__":
     n_heads, n_kv_heads     = 8, 2   # GQA: 4 query heads per KV head
 
     attn      = MultiHeadAttention(n_embed, n_heads, n_kv_heads, max_seq_len=seq_len)
-    freqs_cis = precompute_freqs_cis(dim=n_embed // n_heads, max_seq_len=seq_len)
+    cos, sin = precompute_freqs_cis(dim=n_embed // n_heads, max_seq_len=seq_len)
 
     x   = torch.randn(batch, seq_len, n_embed)
-    out = attn(x, freqs_cis)
+    out = attn(x, cos, sin)
 
     assert out.shape == x.shape, f"shape mismatch: {out.shape} vs {x.shape}"
 
@@ -192,7 +193,7 @@ if __name__ == "__main__":
     # because position 0 cannot attend to position 5 (future)
     x2 = x.clone()
     x2[:, 5, :] += 100.0          # large change at position 5
-    out2 = attn(x2, freqs_cis)
+    out2 = attn(x2, cos, sin)
     diff_at_pos0 = (out[:, 0, :] - out2[:, 0, :]).abs().max().item()
     assert diff_at_pos0 < 1e-4, f"position 0 was affected by position 5 — causal mask broken! diff={diff_at_pos0}"
 

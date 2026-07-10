@@ -64,6 +64,8 @@ PARAMETER COUNT
   Total unique                                                         ≈ 200M
 """
 
+from __future__ import annotations
+
 import torch
 import torch.nn as nn
 import torch.utils.checkpoint as ckpt
@@ -146,13 +148,13 @@ class HybridDecoder(nn.Module):
         # Weight tying: share embedding and lm_head weights
         self.lm_head.weight = self.token_embed.weight
 
-        # Precompute RoPE factors — used by TransformerBlock layers.
-        # GDNBlock ignores freqs_cis (accepts it for interface compatibility).
-        # Multiply by 3 to cover visual prefix (up to 784 patches at 448px)
-        # plus the full text sequence without recomputing at runtime.
-        head_dim  = n_embed // n_heads
-        freqs_cis = precompute_freqs_cis(dim=head_dim, max_seq_len=max_seq_len * 3)
-        self.register_buffer("freqs_cis", freqs_cis)
+        # Precompute RoPE tables (real-valued cos/sin — no complex tensors so
+        # DataParallel buffer replication works correctly).
+        # ×3 covers visual prefix (≤784 patches) + full text sequence.
+        head_dim       = n_embed // n_heads
+        freqs_cos, freqs_sin = precompute_freqs_cis(dim=head_dim, max_seq_len=max_seq_len * 3)
+        self.register_buffer("freqs_cos", freqs_cos)
+        self.register_buffer("freqs_sin", freqs_sin)
 
         self.apply(self._init_weights)
 
@@ -187,22 +189,18 @@ class HybridDecoder(nn.Module):
             x = torch.cat([vision_prefix, x], dim=1)
 
         total_len = x.shape[1]
-        freqs_cis = self.freqs_cis[:total_len]
+        cos = self.freqs_cos[:total_len]
+        sin = self.freqs_sin[:total_len]
 
         for layer in self.layers:
             if self.gradient_checkpointing and self.training:
-                # freqs_cis is complex — passing it as a ckpt.checkpoint positional arg
-                # causes shape corruption with use_reentrant=False. Capture via closure
-                # so only x (the real-valued activation) goes through checkpoint.
-                def _make_fwd(l, fc):
+                def _make_fwd(l, c, s):
                     def _inner(inp):
-                        return l(inp, fc)
+                        return l(inp, c, s)
                     return _inner
-                x = ckpt.checkpoint(_make_fwd(layer, freqs_cis), x, use_reentrant=False)
+                x = ckpt.checkpoint(_make_fwd(layer, cos, sin), x, use_reentrant=False)
             else:
-                # Both GDNBlock and TransformerBlock accept freqs_cis
-                # GDNBlock ignores it; TransformerBlock uses it for RoPE
-                x = layer(x, freqs_cis)
+                x = layer(x, cos, sin)
 
         x      = self.norm(x)
         logits = self.lm_head(x)

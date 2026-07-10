@@ -67,22 +67,18 @@ class TransformerBlock(nn.Module):
         self.norm2 = RMSNorm(n_embed)
         self.mlp   = SwiGLU(n_embed)
 
-    def forward(self, x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            x:          (batch, seq_len, n_embed)
-            freqs_cis:  RoPE rotation factors, passed through to attention
+            x:   (batch, seq_len, n_embed)
+            cos: RoPE cosine table, passed through to attention
+            sin: RoPE sine table, passed through to attention
 
         Returns:
-            (batch, seq_len, n_embed) — same shape, refined representations
+            (batch, seq_len, n_embed)
         """
-        # Attention sub-layer with residual
-        # norm1(x) is normalized, attention runs on it, result added back to raw x
-        x = x + self.attn(self.norm1(x), freqs_cis)
-
-        # MLP sub-layer with residual
+        x = x + self.attn(self.norm1(x), cos, sin)
         x = x + self.mlp(self.norm2(x))
-
         return x
 
 
@@ -93,11 +89,11 @@ if __name__ == "__main__":
     batch, seq_len, n_embed = 2, 12, 256
     n_heads, n_kv_heads     = 8, 2
 
-    block     = TransformerBlock(n_embed, n_heads, n_kv_heads, max_seq_len=seq_len)
-    freqs_cis = precompute_freqs_cis(dim=n_embed // n_heads, max_seq_len=seq_len)
+    block    = TransformerBlock(n_embed, n_heads, n_kv_heads, max_seq_len=seq_len)
+    cos, sin = precompute_freqs_cis(dim=n_embed // n_heads, max_seq_len=seq_len)
 
     x   = torch.randn(batch, seq_len, n_embed)
-    out = block(x, freqs_cis)
+    out = block(x, cos, sin)
 
     assert out.shape == x.shape, f"shape mismatch: {out.shape}"
 

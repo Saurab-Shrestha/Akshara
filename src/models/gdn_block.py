@@ -200,13 +200,12 @@ class GDNBlock(nn.Module):
         self.norm2 = RMSNorm(n_embed)
         self.mlp   = SwiGLU(n_embed)
 
-    def forward(self, x: torch.Tensor, freqs_cis: torch.Tensor = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, cos: torch.Tensor = None, sin: torch.Tensor = None) -> torch.Tensor:
         """
         Args:
             x:         (batch, seq_len, n_embed)
-            freqs_cis: unused (GDN doesn't use RoPE — position is implicit
-                       in the sequential state update order). Accepted for
-                       interface compatibility with TransformerBlock.
+            cos, sin:  unused (GDN doesn't use RoPE). Accepted for interface
+                       compatibility with TransformerBlock.
         Returns:
             (batch, seq_len, n_embed)
         """

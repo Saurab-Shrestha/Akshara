@@ -233,10 +233,17 @@ def main() -> None:
 
     train_iter = iter(train_loader)
 
-    # --- log dir + TensorBoard ---
+    # --- log dir + TensorBoard (optional — falls back to no-op if unavailable) ---
     os.makedirs(cfg.log_dir, exist_ok=True)
-    from torch.utils.tensorboard import SummaryWriter
-    writer = SummaryWriter(log_dir=cfg.log_dir)
+    try:
+        from torch.utils.tensorboard import SummaryWriter
+        writer = SummaryWriter(log_dir=cfg.log_dir)
+    except Exception:
+        class _NoOpWriter:
+            def add_scalar(self, *a, **kw): pass
+            def close(self): pass
+        writer = _NoOpWriter()
+        print("[pretrain] TensorBoard unavailable — console logging only")
 
     # --- training loop ---
     model.train()
