@@ -73,11 +73,25 @@ wget -q 'https://github.com/googlefonts/noto-fonts/raw/main/hinted/ttf/NotoSansD
 ```bash
 # Nepali Wikipedia corpus (Stage 1 language pretrain)
 PYTHONPATH=. python scripts/prepare_data.py --stage corpus --max_samples 200000
+
+# Stage 2A: synthetic single-line crops (rendered from the corpus)
+PYTHONPATH=. python src/data/synth_data.py \
+    --corpus data/corpus/train.jsonl --fonts fonts/ \
+    --out data/crops/lines --n 200000 --max_lines 1
+
+# Stage 2B: synthetic paragraph crops
+PYTHONPATH=. python src/data/synth_data.py \
+    --corpus data/corpus/train.jsonl --fonts fonts/ \
+    --out data/crops/paras --n 100000 --max_lines 12
 ```
 
-> ⚠️ Crop-dataset generation (Stages 2A/2B) is being rebuilt around the new
-> line→paragraph curriculum — see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) §3–4.
-> The old full-page `--stage rendered/cord/iam/synth/merge` paths are stale.
+External datasets worth mixing in (see docs/ARCHITECTURE.md §4):
+
+| Dataset | Use |
+|---|---|
+| [interfaze-ai/ocr-mlt-50m](https://huggingface.co/datasets/interfaze-ai/ocr-mlt-50m) | filter `ne`/`hi` → bulk Stage 2A data (Apache 2.0) |
+| [Mozhi / IIIT printed lines](https://cvit.iiit.ac.in/usodi/tdocrmil.php) | real printed Hindi lines — Stage 2A supplement |
+| [heiDATA printed Devanagari](https://heidata.uni-heidelberg.de/dataset.xhtml?persistentId=doi:10.11588/data/EGOKEI) | 5,139 real lines — held-out **eval only** |
 
 ---
 

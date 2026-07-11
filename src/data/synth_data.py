@@ -1,283 +1,225 @@
 """
-Synthetic Document Generator — full page images with HTML ground truth
-=======================================================================
+Synthetic crop generator — Nepali text → (crop image, text) pairs
+==================================================================
 
-WHY SYNTHETIC DATA FIRST
---------------------------
-Real labeled Nepali document datasets barely exist publicly.  Synthetic data
-lets us generate unlimited training samples with perfect ground truth by
-rendering text programmatically:
+THE CURRICULUM KNOB (docs/ARCHITECTURE.md §3)
+----------------------------------------------
+One generator, one knob:
+    --max_lines 1     → Stage 2A line warmup (Pix2Struct-style reading stage)
+    --max_lines 12    → Stage 2B paragraph crops
 
-  render(html_structure) → (PIL Image, html_string)
+Crops are rendered at NATURAL aspect ratio (a line is wide, a paragraph is
+blocky) — `CropOCRDataset.pad_to_square` handles canvasing at train time,
+exactly like Surya layout crops will at inference time.
 
-The model never sees the rendering code — it only sees the image and must
-predict the HTML.  This is exactly the training signal we need.
+THE INVARIANT: the label is exactly what is drawn. Text that doesn't fit is
+never silently clipped — we stop adding words/lines when the crop is full,
+and the label stops with them.
 
-FONT REQUIREMENT
------------------
-PIL's default font does NOT render Devanagari — characters appear as empty
-boxes.  You must provide a TrueType font that supports Devanagari:
+AUGMENTATIONS (PIL-only, applied per crop with independent probabilities)
+--------------------------------------------------------------------------
+random font / size, ink & paper color jitter, Gaussian blur, pixel noise,
+small rotation, JPEG re-compression, contrast jitter.
+Pix2Struct's warmup used random fonts/colors/sizes; same idea, Nepali fonts.
 
-  Recommended: Noto Sans Devanagari
-  Download:    https://fonts.google.com/noto/specimen/Noto+Sans+Devanagari
-  Or install:  brew install font-noto-sans-devanagari  (macOS)
-               apt install fonts-noto  (Ubuntu)
+USAGE
+-----
+    PYTHONPATH=. python src/data/synth_data.py \
+        --corpus data/corpus/train.jsonl \
+        --fonts fonts/ \
+        --out data/crops/lines \
+        --n 100000 --max_lines 1 --seed 42
 
-If no font_path is given, falls back to PIL default (ASCII only — useful
-for smoke tests with English text).
-
-DOCUMENT TYPES GENERATED
---------------------------
-  paragraph  — one or more <p> blocks (most common document type)
-  heading    — <h1> followed by paragraphs
-  table      — <table> with headers and rows (invoices, forms)
+Output: data/crops/lines/{000000.png, …} + data.jsonl ({"image","text"}).
 """
 
 from __future__ import annotations
 
+import argparse
+import io
 import json
-import os
 import random
-import textwrap
-from typing import List, Optional, Tuple
+from pathlib import Path
 
-from PIL import Image, ImageDraw, ImageFilter, ImageFont
-
-
-def _load_font(font_path: Optional[str], size: int) -> ImageFont.FreeTypeFont:
-    if font_path and os.path.exists(font_path):
-        return ImageFont.truetype(font_path, size)
-    return ImageFont.load_default()
+from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont
 
 
-def _line_height(font, sample: str = "Aम") -> int:
-    try:
-        bbox = font.getbbox(sample)
-        return bbox[3] - bbox[1] + 4
-    except AttributeError:
-        return font.getsize(sample)[1] + 4
+# ── text sampling ──────────────────────────────────────────────────────────────
+
+def load_corpus(path: str) -> list[str]:
+    """Load text lines from a Stage-1 corpus JSONL ({"text": ...} per line)."""
+    texts = []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            t = json.loads(line).get("text", "").strip()
+            if len(t) >= 4:
+                texts.append(t)
+    if not texts:
+        raise ValueError(f"no usable text in {path}")
+    return texts
 
 
-def _draw_wrapped(draw, xy, text, font, color, max_width):
-    """Draw text with word-wrap. Returns y after last line."""
-    try:
-        avg_w = max(1, font.getlength("म") or font.getlength("a"))
-    except AttributeError:
-        avg_w = 10
-    chars = max(1, int(max_width / avg_w))
-    lh    = _line_height(font)
-    x, y  = xy
-    for para in text.split("\n"):
-        for line in textwrap.wrap(para, width=chars) or [para]:
-            draw.text((x, y), line, font=font, fill=color)
-            y += lh
-    return y
+def sample_words(texts: list[str], rng: random.Random, n_words: int) -> list[str]:
+    """Sample a contiguous run of words from a random corpus document."""
+    words: list[str] = []
+    while len(words) < n_words:
+        doc = rng.choice(texts).split()
+        if not doc:
+            continue
+        start = rng.randrange(len(doc))
+        words.extend(doc[start : start + n_words - len(words)])
+    return words
 
 
-def _random_bg():
-    v = random.randint(230, 255)
-    return (v, v, v)
+# ── rendering ──────────────────────────────────────────────────────────────────
+
+def _rand_colors(rng: random.Random) -> tuple[tuple, tuple]:
+    """(paper, ink) — mostly dark-on-light, occasionally inverted."""
+    if rng.random() < 0.9:
+        paper = tuple(rng.randint(225, 255) for _ in range(3))
+        ink   = tuple(rng.randint(0, 70)    for _ in range(3))
+    else:
+        paper = tuple(rng.randint(0, 60)    for _ in range(3))
+        ink   = tuple(rng.randint(200, 255) for _ in range(3))
+    return paper, ink
 
 
-def _random_fg():
-    v = random.randint(0, 40)
-    return (v, v, v)
+def render_crop(
+    texts:     list[str],
+    fonts:     list[str],
+    rng:       random.Random,
+    max_lines: int = 1,
+) -> tuple[Image.Image, str]:
+    """
+    Render 1..max_lines lines of corpus text at natural aspect ratio.
+
+    Returns (image, label) — label is exactly the drawn text, lines joined
+    with a single space (the recognizer outputs plain running text; visual
+    line breaks are presentation, not content).
+    """
+    n_lines   = rng.randint(1, max_lines)
+    font_size = rng.randint(18, 48)
+    font      = ImageFont.truetype(rng.choice(fonts), font_size)
+    paper, ink = _rand_colors(rng)
+
+    # Target line width in px — longer for single lines (real lines are wide),
+    # tighter for paragraphs (column-ish blocks)
+    max_width = rng.randint(300, 900) if n_lines == 1 else rng.randint(250, 600)
+
+    margin       = rng.randint(4, int(font_size * 0.8))
+    line_spacing = int(font_size * rng.uniform(1.25, 1.7))
+
+    # Fill lines word-by-word; the label is what actually fits
+    probe = ImageDraw.Draw(Image.new("RGB", (8, 8)))
+    words = sample_words(texts, rng, n_words=n_lines * 14)
+    lines: list[str] = []
+    cur = ""
+    for w in words:
+        cand = (cur + " " + w).strip()
+        if probe.textlength(cand, font=font) <= max_width or not cur:
+            cur = cand
+        else:
+            lines.append(cur)
+            if len(lines) == n_lines:
+                cur = ""
+                break
+            cur = w
+    if cur and len(lines) < n_lines:
+        lines.append(cur)
+
+    label  = " ".join(lines)
+    width  = int(max(probe.textlength(l, font=font) for l in lines)) + 2 * margin
+    height = line_spacing * len(lines) + 2 * margin
+
+    img  = Image.new("RGB", (width, height), paper)
+    draw = ImageDraw.Draw(img)
+    for i, line in enumerate(lines):
+        draw.text((margin, margin + i * line_spacing), line, font=font, fill=ink)
+
+    return img, label
 
 
-def _augment(img: Image.Image, seed: int) -> Image.Image:
-    random.seed(seed + 9999)
-    angle = random.uniform(-1.5, 1.5)
-    if abs(angle) > 0.3:
-        img = img.rotate(angle, resample=Image.BICUBIC, fillcolor=_random_bg())
-    r = random.uniform(0.0, 0.8)
-    if r > 0.4:
-        img = img.filter(ImageFilter.GaussianBlur(radius=r))
+def augment(img: Image.Image, rng: random.Random) -> Image.Image:
+    """Light document-noise augmentations. Each applied independently."""
+    if rng.random() < 0.3:
+        img = img.filter(ImageFilter.GaussianBlur(radius=rng.uniform(0.3, 1.2)))
+    if rng.random() < 0.3:
+        img = ImageEnhance.Contrast(img).enhance(rng.uniform(0.6, 1.3))
+    if rng.random() < 0.25:  # small skew; fill with paper color from a corner
+        img = img.rotate(rng.uniform(-2.0, 2.0), expand=True,
+                         fillcolor=img.getpixel((1, 1)))
+    if rng.random() < 0.3:   # JPEG artifacts
+        buf = io.BytesIO()
+        img.save(buf, "JPEG", quality=rng.randint(30, 75))
+        img = Image.open(buf).convert("RGB")
+    if rng.random() < 0.25:  # sparse salt-and-pepper noise
+        px = img.load()
+        w, h = img.size
+        for _ in range(int(w * h * 0.002)):
+            x, y = rng.randrange(w), rng.randrange(h)
+            v = rng.randint(0, 255)
+            px[x, y] = (v, v, v)
     return img
 
 
-def generate_paragraph_page(
-    paragraphs: List[str],
-    font_path: Optional[str] = None,
-    img_size: int = 448,
-    font_size: int = 18,
-    seed: int = 0,
-) -> Tuple[Image.Image, str]:
-    """Render paragraphs. Returns (image, html)."""
-    random.seed(seed)
-    img  = Image.new("RGB", (img_size, img_size), _random_bg())
-    draw = ImageDraw.Draw(img)
-    font = _load_font(font_path, font_size)
-    fg   = _random_fg()
-    m    = int(img_size * 0.06)
-    y    = m
-    html_parts = []
-    for p in paragraphs:
-        y = _draw_wrapped(draw, (m, y), p, font, fg, img_size - 2 * m)
-        y += int(font_size * 0.6)
-        html_parts.append(f"<p>{p}</p>")
-    return _augment(img, seed), "".join(html_parts)
+# ── driver ─────────────────────────────────────────────────────────────────────
+
+def generate(
+    corpus:    str,
+    fonts_dir: str,
+    out_dir:   str,
+    n:         int,
+    max_lines: int = 1,
+    seed:      int = 42,
+):
+    # Complex-script shaping check: without libraqm PIL draws Devanagari
+    # matras/conjuncts in the wrong positions — silently corrupting every
+    # training label. Fail loudly instead.
+    from PIL import features
+    if not features.check("raqm"):
+        raise RuntimeError(
+            "PIL lacks libraqm — Devanagari will render with broken matra/"
+            "conjunct shaping. Install with: pip install pillow --no-binary "
+            ":all: (after `apt install libraqm-dev`) or use a Pillow wheel "
+            "with raqm support.")
+
+    rng   = random.Random(seed)
+    texts = load_corpus(corpus)
+    fonts = sorted(str(p) for ext in ("*.ttf", "*.otf") for p in Path(fonts_dir).glob(ext))
+    if not fonts:
+        raise FileNotFoundError(
+            f"no .ttf/.otf fonts in {fonts_dir} — see README for the Noto "
+            "Devanagari download command; add more fonts for variety")
+
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    print(f"[synth] {n:,} crops | max_lines={max_lines} | "
+          f"{len(fonts)} fonts | {len(texts):,} corpus docs → {out}")
+
+    with open(out / "data.jsonl", "w", encoding="utf-8") as f:
+        for i in range(n):
+            img, label = render_crop(texts, fonts, rng, max_lines)
+            img = augment(img, rng)
+            fname = f"{i:06d}.png"
+            img.save(out / fname)
+            f.write(json.dumps({"image": fname, "text": label},
+                               ensure_ascii=False) + "\n")
+            if (i + 1) % 5000 == 0:
+                print(f"  {i + 1:,}/{n:,}")
+    print(f"[synth] done → {out}/data.jsonl")
 
 
-def generate_heading_page(
-    title: str,
-    paragraphs: List[str],
-    font_path: Optional[str] = None,
-    img_size: int = 448,
-    seed: int = 0,
-) -> Tuple[Image.Image, str]:
-    """Render heading + paragraphs. Returns (image, html)."""
-    random.seed(seed)
-    img    = Image.new("RGB", (img_size, img_size), _random_bg())
-    draw   = ImageDraw.Draw(img)
-    h1f    = _load_font(font_path, 26)
-    pf     = _load_font(font_path, 18)
-    fg     = _random_fg()
-    m      = int(img_size * 0.06)
-    y      = m
-    y      = _draw_wrapped(draw, (m, y), title, h1f, fg, img_size - 2 * m)
-    y     += int(26 * 0.8)
-    html_parts = [f"<h1>{title}</h1>"]
-    for p in paragraphs:
-        y = _draw_wrapped(draw, (m, y), p, pf, fg, img_size - 2 * m)
-        y += int(18 * 0.6)
-        html_parts.append(f"<p>{p}</p>")
-    return _augment(img, seed), "".join(html_parts)
-
-
-def generate_table_page(
-    headers: List[str],
-    rows: List[List[str]],
-    caption: Optional[str] = None,
-    font_path: Optional[str] = None,
-    img_size: int = 448,
-    seed: int = 0,
-) -> Tuple[Image.Image, str]:
-    """Render a table with optional caption. Returns (image, html)."""
-    random.seed(seed)
-    img   = Image.new("RGB", (img_size, img_size), _random_bg())
-    draw  = ImageDraw.Draw(img)
-    font  = _load_font(font_path, 16)
-    hfont = _load_font(font_path, 17)
-    fg    = _random_fg()
-    grid  = (150, 150, 150)
-    m     = int(img_size * 0.06)
-    y     = m
-    html_parts = []
-
-    if caption:
-        y = _draw_wrapped(draw, (m, y), caption, _load_font(font_path, 20), fg, img_size - 2 * m)
-        y += 10
-        html_parts.append(f"<p>{caption}</p>")
-
-    n_cols = len(headers)
-    col_w  = (img_size - 2 * m) // max(1, n_cols)
-    lh     = _line_height(font) + 6
-
-    for ci, hdr in enumerate(headers):
-        x = m + ci * col_w
-        draw.rectangle([x, y, x + col_w, y + lh], outline=grid)
-        draw.text((x + 4, y + 3), hdr[:20], font=hfont, fill=fg)
-    y += lh
-
-    for row in rows:
-        for ci, cell in enumerate(row):
-            x = m + ci * col_w
-            draw.rectangle([x, y, x + col_w, y + lh], outline=grid)
-            draw.text((x + 4, y + 3), str(cell)[:20], font=font, fill=fg)
-        y += lh
-
-    th = "".join(f"<th>{h}</th>" for h in headers)
-    tr = "".join("<tr>" + "".join(f"<td>{c}</td>" for c in row) + "</tr>" for row in rows)
-    html_parts.append(f"<table><tr>{th}</tr>{tr}</table>")
-    return _augment(img, seed), "".join(html_parts)
-
-
-def generate_dataset(
-    output_dir: str,
-    n_samples: int,
-    texts: List[str],
-    font_path: Optional[str] = None,
-    img_size: int = 448,
-    seed: int = 0,
-) -> str:
-    """
-    Generate a synthetic document dataset.
-
-    Returns path to data.jsonl written in output_dir.
-    Document type (paragraph / heading / table) is chosen randomly per sample.
-    """
-    os.makedirs(output_dir, exist_ok=True)
-    rng     = random.Random(seed)
-    records = []
-
-    for i in range(n_samples):
-        s        = seed + i
-        doc_type = rng.choice(["paragraph", "heading", "table"])
-
-        if doc_type == "paragraph":
-            paras = rng.sample(texts, min(3, len(texts)))
-            img, html = generate_paragraph_page(paras, font_path, img_size, seed=s)
-
-        elif doc_type == "heading":
-            title = rng.choice(texts)
-            rest  = [t for t in texts if t != title]
-            paras = rng.sample(rest, min(2, len(rest)))
-            img, html = generate_heading_page(title, paras, font_path, img_size, seed=s)
-
-        else:  # table
-            n_cols  = rng.randint(2, 4)
-            headers = [rng.choice(texts)[:12] for _ in range(n_cols)]
-            rows    = [[rng.choice(texts)[:12] for _ in range(n_cols)] for _ in range(rng.randint(2, 5))]
-            caption = rng.choice(texts) if rng.random() > 0.5 else None
-            img, html = generate_table_page(headers, rows, caption, font_path, img_size, seed=s)
-
-        fname = f"{i:06d}.png"
-        img.save(os.path.join(output_dir, fname))
-        records.append({"image": fname, "html": html})
-
-        if (i + 1) % 500 == 0:
-            print(f"  {i + 1}/{n_samples}")
-
-    jsonl_path = os.path.join(output_dir, "data.jsonl")
-    with open(jsonl_path, "w", encoding="utf-8") as f:
-        for r in records:
-            f.write(json.dumps(r, ensure_ascii=False) + "\n")
-
-    print(f"Wrote {n_samples} samples → {jsonl_path}")
-    return jsonl_path
-
-
-# ── self-check ──────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    import tempfile
-
-    TEXTS = [
-        "नेपाल एक सुन्दर देश हो।",
-        "काठमाडौं राजधानी शहर हो।",
-        "हिमालय पर्वत श्रृंखला यहाँ छ।",
-        "नेपाली भाषा देवनागरी लिपिमा लेखिन्छ।",
-        "Total amount: Rs 500",
-        "मूल्य", "वस्तु", "मात्रा",
-    ]
-
-    print("synth_data self-check (ASCII fallback — no Devanagari font)")
-    print("=" * 55)
-
-    with tempfile.TemporaryDirectory() as tmp:
-        jsonl = generate_dataset(tmp, n_samples=6, texts=TEXTS, img_size=112, seed=7)
-
-        with open(jsonl) as f:
-            records = [json.loads(l) for l in f]
-
-        assert len(records) == 6
-        for r in records:
-            img = Image.open(os.path.join(tmp, r["image"]))
-            assert img.size == (112, 112)
-            assert r["html"].strip()
-
-        print(f"\n  {len(records)} samples  ✅")
-        for r in records[:3]:
-            print(f"    {r['html'][:80]}")
-
-    print("\nSelf-check PASSED ✅")
-    print("\nNOTE: pass font_path='NotoSansDevanagari-Regular.ttf' for Devanagari rendering")
+    ap = argparse.ArgumentParser(description="Akshara synthetic crop generator")
+    ap.add_argument("--corpus",    required=True, help="Stage-1 corpus JSONL")
+    ap.add_argument("--fonts",     default="fonts/", help="dir of .ttf/.otf Devanagari fonts")
+    ap.add_argument("--out",       required=True, help="output directory")
+    ap.add_argument("--n",         type=int, default=10_000)
+    ap.add_argument("--max_lines", type=int, default=1,
+                    help="1 = Stage 2A line warmup; ~12 = Stage 2B paragraphs")
+    ap.add_argument("--seed",      type=int, default=42)
+    a = ap.parse_args()
+    generate(a.corpus, a.fonts, a.out, a.n, a.max_lines, a.seed)

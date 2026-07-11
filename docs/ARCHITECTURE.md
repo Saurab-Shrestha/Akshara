@@ -194,6 +194,21 @@ input   = [BOS] t₁ … tₙ [EOS] [EOS] … [EOS]   ← pad with EOS (embeddab
 target  =  t₁ … tₙ [EOS] [-100] … [-100]       ← pad with -100 (loss-masked)
 ```
 
+### External datasets (surveyed 2026-07)
+
+| Dataset | Content | Role |
+|---|---|---|
+| [interfaze-ai/ocr-mlt-50m](https://huggingface.co/datasets/interfaze-ai/ocr-mlt-50m) | 50 M image-text pairs, 50 langs incl. **Nepali + Hindi**, synthetic (2 400+ fonts) + real, Apache 2.0 | filter `lang ∈ {ne, hi}` → bulk Stage 2A training mix |
+| [Mozhi (IIIT)](https://cvit.iiit.ac.in/usodi/tdocrmil.php) | 1.2 M **real printed** word/line images, 13 Indic langs; Hindi ≈100 k with line-level splits | real printed Devanagari lines for Stage 2A/3 |
+| [heiDATA printed Devanagari](https://heidata.uni-heidelberg.de/dataset.xhtml?persistentId=doi:10.11588/data/EGOKEI) | 5 139 real printed line images + ALTO XML from 247 page scans | held-out **eval set** — never train on it |
+
+Synthetic generation is still required for paragraph crops (nobody publishes
+those), Nepali-specific vocabulary distribution, and the curriculum knob.
+
+`src/data/synth_data.py` hard-fails if PIL lacks **libraqm** — without it
+Devanagari matras/conjuncts render in wrong positions and every label would
+be silently corrupt.
+
 ---
 
 ## 5. Repository map
