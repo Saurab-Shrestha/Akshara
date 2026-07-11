@@ -168,17 +168,18 @@ def main() -> None:
         n_layers    = saved_config.get("n_layers",    12),
         max_seq_len = saved_config.get("max_seq_len", 512),
         attn_every  = saved_config.get("attn_every",  4),
-        img_size    = saved_config.get("img_size",    224),
-        patch_size  = saved_config.get("patch_size",  16),
+        img_size    = saved_config.get("img_size",    448),
+        patch_size  = saved_config.get("patch_size",  14),
         vision_dim  = saved_config.get("vision_dim",  384),
         vit_layers  = saved_config.get("vit_layers",  12),
         vit_heads   = saved_config.get("vit_heads",   6),
+        vit_pretrained = False,  # weights come from the checkpoint
     )
     model.load_state_dict(ck["model_state_dict"])
     model = model.to(device)
     model.eval()
 
-    img_size = saved_config.get("img_size", 224)
+    img_size = saved_config.get("img_size", 448)
 
     # --- tokenizer ---
     from transformers import AutoTokenizer

@@ -245,6 +245,7 @@ def main() -> None:
         vision_dim=cfg.vision_dim,
         vit_layers=cfg.vit_layers,
         vit_heads=cfg.vit_heads,
+        vit_pretrained=cfg.vit_pretrained,
     )
     if cfg.use_gradient_checkpointing:
         model.set_gradient_checkpointing(True)
@@ -253,7 +254,7 @@ def main() -> None:
     pretrain_ckpt = cfg.pretrain_ckpt
     if pretrain_ckpt and os.path.exists(pretrain_ckpt):
         ck = torch.load(pretrain_ckpt, map_location="cpu", weights_only=False)
-        # Load only the decoder weights; vision encoder starts from scratch.
+        # Load only the decoder weights; vision encoder keeps its DINOv2 init.
         model.decoder.load_state_dict(ck["model_state_dict"], strict=True)
         print(f"[train_ocr] loaded decoder weights from {pretrain_ckpt}")
     elif pretrain_ckpt:

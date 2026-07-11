@@ -57,12 +57,13 @@ class ModelConfig:
     max_seq_len: int = 512            # text tokens per crop (a dense paragraph fits)
     attn_every: int = 4               # full attention every N layers; others use GDN
 
-    # Vision encoder (ViT-S/16)
-    img_size: int = 448               # input image resolution — 448px fits a full page
-    patch_size: int = 16              # ViT patch size → 28×28=784 patch tokens at 448px
-    vision_dim: int = 384             # ViT hidden dimension
-    vit_layers: int = 12              # ViT transformer depth
-    vit_heads: int = 6                # ViT attention heads
+    # Vision encoder (DINOv2-S/14, pretrained)
+    img_size: int = 448               # crop canvas size (aspect-preserving pad)
+    patch_size: int = 14              # DINOv2 patch size → 32×32=1024 patch tokens at 448px
+    vision_dim: int = 384             # DINOv2-small hidden dimension
+    vit_layers: int = 12              # (informational — architecture fixed by dinov2-small)
+    vit_heads: int = 6                # (informational)
+    vit_pretrained: bool = True       # init from facebook/dinov2-small weights
 
 
 # ---------------------------------------------------------------------------

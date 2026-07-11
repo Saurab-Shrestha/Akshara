@@ -106,9 +106,9 @@ class MultiHeadAttention(nn.Module):
         self.wo = nn.Linear(n_heads * self.head_dim, n_embed, bias=False)
 
         # Causal mask: lower-triangular matrix of True.
-        # Built for 3× max_seq_len to cover visual prefix + text sequence
-        # without recomputing at runtime.
-        _mask_len = max_seq_len * 3
+        # Built for 4× max_seq_len to cover visual prefix + text sequence
+        # at up to 518px input (1369 patches) without recomputing at runtime.
+        _mask_len = max_seq_len * 4
         mask = torch.tril(torch.ones(_mask_len, _mask_len, dtype=torch.bool))
         self.register_buffer("causal_mask", mask)
 

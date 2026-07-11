@@ -65,13 +65,14 @@ class Akshara(nn.Module):
 
     def __init__(
         self,
-        # Vision encoder config (ViT-S/16)
+        # Vision encoder config (DINOv2-S/14)
         img_size:    int = 448,
-        patch_size:  int = 16,
+        patch_size:  int = 14,
         in_channels: int = 3,
         vision_dim:  int = 384,
         vit_layers:  int = 12,
         vit_heads:   int = 6,
+        vit_pretrained: bool = True,
         # Decoder config
         vocab_size:  int = 248_077,
         n_embed:     int = 768,    # renamed from decoder_dim to match ModelConfig / HybridDecoder
@@ -90,6 +91,7 @@ class Akshara(nn.Module):
             embed_dim   = vision_dim,
             n_layers    = vit_layers,
             n_heads     = vit_heads,
+            pretrained  = vit_pretrained,
         )
 
         self.connector = Connector(
@@ -269,7 +271,7 @@ class Akshara(nn.Module):
 # ── default config ─────────────────────────────────────────────────────────────
 DEFAULT_CONFIG = dict(
     img_size    = 448,
-    patch_size  = 16,
+    patch_size  = 14,
     in_channels = 3,
     vision_dim  = 384,
     vit_layers  = 12,

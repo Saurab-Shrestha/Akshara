@@ -150,9 +150,10 @@ class HybridDecoder(nn.Module):
 
         # Precompute RoPE tables (real-valued cos/sin — no complex tensors so
         # DataParallel buffer replication works correctly).
-        # ×3 covers visual prefix (≤784 patches) + full text sequence.
+        # ×4 covers the visual prefix + full text at any supported resolution:
+        # 448px → 1024 patches, 518px → 1369 patches; 1369 + 512 < 2048.
         head_dim       = n_embed // n_heads
-        freqs_cos, freqs_sin = precompute_freqs_cis(dim=head_dim, max_seq_len=max_seq_len * 3)
+        freqs_cos, freqs_sin = precompute_freqs_cis(dim=head_dim, max_seq_len=max_seq_len * 4)
         self.register_buffer("freqs_cos", freqs_cos)
         self.register_buffer("freqs_sin", freqs_sin)
 

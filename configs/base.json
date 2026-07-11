@@ -8,7 +8,7 @@
   "max_seq_len": 512,
   "attn_every": 4,
   "img_size": 448,
-  "patch_size": 16,
+  "patch_size": 14,
   "vision_dim": 384,
   "vit_layers": 12,
   "vit_heads": 6,

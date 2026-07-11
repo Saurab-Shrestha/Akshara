@@ -19,7 +19,7 @@ Surya layout + table structure (pretrained)   — paragraphs, headings, table ce
     ▼  region / cell crops (448×448, aspect-preserving pad)
     │
 Akshara recognizer (trained by us):
-    ViT-S/16 encoder       — 784 patches, factorized 2D positions
+    DINOv2-S/14 encoder    — pretrained, 1024 patches
     Connector (MLP+norm)   — 384 → 768
     Hybrid decoder         — 12 layers, GDN:attention 3:1, GQA, RoPE
     │
@@ -175,7 +175,7 @@ PYTHONPATH=. python scripts/train_ocr.py \
 akshara/
 ├── src/
 │   ├── models/
-│   │   ├── vit.py              # ViT-S/16 vision encoder
+│   │   ├── vit.py              # DINOv2-S/14 encoder wrapper (pretrained)
 │   │   ├── hybrid_decoder.py   # Transformer + GDN hybrid decoder
 │   │   ├── attention.py        # Multi-head attention (GQA + RoPE)
 │   │   ├── gdn_block.py        # GDN block

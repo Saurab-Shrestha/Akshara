@@ -58,7 +58,10 @@ class AksharaPipeline:
         model_keys = ("img_size", "patch_size", "vision_dim", "vit_layers", "vit_heads",
                       "vocab_size", "n_embed", "n_heads", "n_kv_heads", "n_layers",
                       "max_seq_len", "attn_every")
-        self.model = Akshara(**{k: cfg[k] for k in model_keys if k in cfg})
+        # vit_pretrained=False: weights come from the checkpoint — no need to
+        # download DINOv2 just to overwrite it
+        self.model = Akshara(**{k: cfg[k] for k in model_keys if k in cfg},
+                             vit_pretrained=False)
         self.model.load_state_dict(ck["model_state_dict"])
         self.model.to(device).eval()
         self.img_size = cfg.get("img_size", 448)

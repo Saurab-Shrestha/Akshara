@@ -48,9 +48,9 @@ shrinks to "read what you see."
 
 ```mermaid
 flowchart LR
-    A["crop<br/>3×448×448"] --> B["ViT-S/16 encoder<br/>28×28 = 784 patches<br/>dim 384, 12 layers"]
+    A["crop<br/>3×448×448"] --> B["DINOv2-S/14 encoder<br/><i>pretrained</i><br/>32×32 = 1024 patches<br/>dim 384"]
     B --> C["Connector<br/>MLP 384→768<br/>+ RMSNorm gain 0.02"]
-    C --> D["visual prefix<br/>784 × 768"]
+    C --> D["visual prefix<br/>1024 × 768"]
     D --> E["HybridDecoder<br/>12 layers, dim 768<br/>GDN:attention 3:1"]
     T["text tokens so far"] --> E
     E --> F["next-token logits<br/>vocab 248 077"]
@@ -65,18 +65,28 @@ it unreadable; padding does not. Implemented in
 `src/data/ocr_dataset.py::pad_to_square` — identical at train and inference.
 
 *Upgrade path:* Pix2Struct-style variable-resolution input (scale each image
-to a fixed *patch budget*, any grid shape). The ViT already uses factorized
-row/col position tables, so this needs no positional surgery — only batch
+to a fixed *patch budget*, any grid shape). DINOv2's position embeddings
+interpolate to any grid, so this needs no positional surgery — only batch
 padding/masking. Do it when padding waste measurably hurts throughput.
 
-### 2.2 Vision encoder — ViT-S/16 (~22 M params)
+### 2.2 Vision encoder — DINOv2-S/14, pretrained (~22 M params)
 
-- 448×448 input → 16×16 patches → 28×28 = **784 patch tokens**, dim 384.
-- **Factorized 2D positions**: `pos(r,c) = row_embed[r] + col_embed[c]`
-  (Pix2Struct-style). Grid-shape-agnostic; `resize_grid()` interpolates the
-  two 1-D tables for a different canvas.
-- Bidirectional attention (no causal mask — images aren't sequential).
-- No CLS token: OCR reads all patches; a global summary token is dead weight.
+- `facebook/dinov2-small`, self-supervised on 142 M images, wrapped via
+  `transformers.Dinov2Model` (~100-line wrapper in `src/models/vit.py`).
+- 448×448 input → 14×14 patches → 32×32 = **1024 patch tokens**, dim 384.
+  DINOv2's position embeddings interpolate to any grid
+  (`interpolate_pos_encoding=True`), so the variable-resolution upgrade path
+  survives. CLS token is dropped at output.
+- **Why pretrained beats from-scratch here**: Donut/Nougat initialized from
+  ImageNet Swin; Pix2Struct trained vision from scratch but with 80 M
+  screenshots on 64 TPUs. On two T4s with synthetic crops, a pretrained
+  encoder is the single highest-leverage choice in the system — it already
+  knows edges, strokes and paper texture; training only teaches it
+  Devanagari. (Surya 2's card doesn't disclose its encoder init, so it
+  offers no counter-evidence.)
+- DINOv2 uses the same ImageNet mean/std normalization as our datasets.
+- Budget check: 1024 visual + 512 text = 1536 = 3 × `max_seq_len` — exactly
+  what the decoder's RoPE tables and causal mask are sized for.
 
 ### 2.3 Connector (~0.9 M params)
 
@@ -102,7 +112,7 @@ drowns it out early in training.
     (`fla.ops.gated_delta_rule`).
 - **Attention layers** (3): exact-recall checkpoints. GQA 12 query / 3 KV
   heads, RoPE (real cos/sin tables — complex tensors break DataParallel
-  buffer replication). Tables sized `max_seq_len × 3` to cover the 784-token
+  buffer replication). Tables sized `max_seq_len × 3` to cover the 1024-token
   visual prefix + text.
 - Weight-tied embedding/LM head; depth-scaled init (`0.02/√(2·n_layers)`)
   on residual output projections.
@@ -199,7 +209,7 @@ akshara/
 │   └── prepare_data.py        # corpus/dataset download
 ├── src/
 │   ├── models/
-│   │   ├── vit.py             # ViT-S/16, factorized 2D positions
+│   │   ├── vit.py             # DINOv2-S/14 wrapper (pretrained)
 │   │   ├── connector.py       # MLP bridge + scale-matching RMSNorm
 │   │   ├── hybrid_decoder.py  # 3:1 GDN/attention decoder
 │   │   ├── gdn_block.py       # Gated DeltaNet (fp32 recurrence)
@@ -221,7 +231,7 @@ akshara/
 - **Target:** Kaggle T4 ×2 (2×16 GB), `nn.DataParallel`, bf16 autocast,
   gradient checkpointing. Model returns loss inside `forward`, so training
   scripts call `loss.mean()` (DataParallel gathers one loss per GPU).
-- **Throughput ceiling:** the GDN Python loop runs 784+512 sequential steps
+- **Throughput ceiling:** the GDN Python loop runs 1024+512 sequential steps
   per layer per forward. Fine for smoke tests and Stage 1 (text-only, 512
   steps); swap in FLA's Triton kernel before long Stage-2 runs.
 - **No KV cache yet:** `generate()` re-runs the decoder over the full prefix
