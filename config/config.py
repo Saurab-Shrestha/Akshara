@@ -54,7 +54,7 @@ class ModelConfig:
     n_heads: int = 12                 # number of query heads
     n_kv_heads: int = 3               # GQA: 12/3=4 queries share each KV head
     n_layers: int = 12                # total decoder layers
-    max_seq_len: int = 2048           # maximum token sequence length (full-page HTML)
+    max_seq_len: int = 512            # text tokens per crop (a dense paragraph fits)
     attn_every: int = 4               # full attention every N layers; others use GDN
 
     # Vision encoder (ViT-S/16)

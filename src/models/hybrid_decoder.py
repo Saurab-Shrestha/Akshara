@@ -158,6 +158,15 @@ class HybridDecoder(nn.Module):
 
         self.apply(self._init_weights)
 
+        # Depth-scaled init on residual-branch output projections (GPT-2/LLaMA):
+        # without this the residual stream variance grows linearly over
+        # 2*n_layers sublayers.
+        residual_scale = 0.02 / (2 * n_layers) ** 0.5
+        for layer in self.layers:
+            for name, p in layer.named_parameters():
+                if name.endswith("wo.weight") or name.endswith("w_out.weight"):
+                    nn.init.normal_(p, mean=0.0, std=residual_scale)
+
     def _init_weights(self, module: nn.Module):
         if isinstance(module, nn.Linear):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
@@ -214,9 +223,13 @@ class HybridDecoder(nn.Module):
                 logits_for_loss = logits
 
             B, L, V = logits_for_loss.shape
+            # ignore_index=-100: datasets mark padding positions (everything
+            # after the first EOS) as -100 so the model is never supervised
+            # to spam EOS over padding.
             loss = torch.nn.functional.cross_entropy(
                 logits_for_loss.reshape(B * L, V),
                 targets.reshape(B * L).long(),
+                ignore_index=-100,
             )
 
         return logits, loss
@@ -248,7 +261,7 @@ class HybridDecoder(nn.Module):
 
 # ── default config ─────────────────────────────────────────────────────────────
 DEFAULT_CONFIG = dict(
-    vocab_size  = 248_044,
+    vocab_size  = 248_077,
     n_embed     = 768,
     n_heads     = 12,
     n_kv_heads  = 3,

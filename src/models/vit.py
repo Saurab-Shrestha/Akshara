@@ -74,7 +74,6 @@ PARAMETER COUNT (ViT-S/16, 224×224)
 
 import torch
 import torch.nn as nn
-import math
 
 from src.models.rms_norm import RMSNorm
 from src.models.swiglu import SwiGLU
@@ -206,15 +205,17 @@ class VisionEncoder(nn.Module):
 
         # Patch embedding: image → patch sequence
         self.patch_embed = PatchEmbed(img_size, patch_size, in_channels, embed_dim)
-        n_patches = self.patch_embed.n_patches
+        self.grid = img_size // patch_size  # patches per side (28 at 448/16)
 
-        # CLS token: a learned vector prepended to the patch sequence
-        # Aggregates global image features (used by classification heads, optional for OCR)
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        # Factorized 2D position embedding (Pix2Struct-style): a row table and
+        # a column table instead of one flat table. pos(r, c) = row[r] + col[c].
+        # Grid-shape-agnostic: a future variable-resolution input (patch budget
+        # instead of fixed canvas) reuses the same tables for any H×W grid.
+        self.row_embed = nn.Parameter(torch.zeros(self.grid, embed_dim))
+        self.col_embed = nn.Parameter(torch.zeros(self.grid, embed_dim))
 
-        # Learned 2D position embedding: one vector per position (CLS + all patches)
-        # Shape: (1, 1 + n_patches, embed_dim) — broadcast over batch
-        self.pos_embed = nn.Parameter(torch.zeros(1, 1 + n_patches, embed_dim))
+        # No CLS token: OCR reads all patch tokens; a global summary token
+        # is dead weight here.
 
         # Transformer blocks — bidirectional attention (no causal mask)
         self.blocks = nn.ModuleList([
@@ -228,9 +229,8 @@ class VisionEncoder(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        # Standard ViT init: small normal for everything
-        nn.init.trunc_normal_(self.cls_token, std=0.02)
-        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+        nn.init.trunc_normal_(self.row_embed, std=0.02)
+        nn.init.trunc_normal_(self.col_embed, std=0.02)
 
         for module in self.modules():
             if isinstance(module, nn.Linear):
@@ -244,73 +244,48 @@ class VisionEncoder(nn.Module):
         """
         Args:
             images: (batch, 3, img_size, img_size) — normalized RGB images
+                    (aspect-preserving resize + white padding done by the dataset)
 
         Returns:
-            (batch, n_patches, embed_dim)  — patch tokens WITHOUT the CLS token
-            The CLS token is dropped: the decoder's cross-attention-like read
-            via vision_prefix benefits from spatial patch tokens, not a single
-            global summary. Keeping CLS would just add one extra token the
-            decoder doesn't need.
+            (batch, n_patches, embed_dim) — one token per patch, row-major order
         """
-        B = images.shape[0]
-
         # 1. Embed patches: (B, 3, H, W) → (B, n_patches, embed_dim)
         x = self.patch_embed(images)
 
-        # 2. Prepend CLS token: (1, 1, embed_dim) → (B, 1, embed_dim)
-        cls = self.cls_token.expand(B, -1, -1)   # broadcast over batch
-        x   = torch.cat([cls, x], dim=1)         # (B, 1 + n_patches, embed_dim)
+        # 2. Add factorized 2D position: pos(r, c) = row[r] + col[c]
+        # row-major patch order matches PatchEmbed's flatten
+        g = self.grid
+        pos = (self.row_embed.unsqueeze(1) + self.col_embed.unsqueeze(0))  # (g, g, dim)
+        x = x + pos.reshape(1, g * g, -1)
 
-        # 3. Add position embedding (learned, not RoPE — 2D structure)
-        x = x + self.pos_embed
-
-        # 4. Pass through transformer blocks
+        # 3. Transformer blocks (bidirectional)
         for block in self.blocks:
             x = block(x)
 
-        x = self.norm(x)
+        return self.norm(x)  # (B, n_patches, embed_dim)
 
-        # 5. Drop CLS, return only patch tokens
-        return x[:, 1:, :]   # (B, n_patches, embed_dim)
-
-    def interpolate_pos_embed(self, new_img_size: int, patch_size: int = 16):
+    def resize_grid(self, new_img_size: int, patch_size: int = 16):
         """
-        Resize learned position embeddings for a different image size.
-
-        Useful when we want to fine-tune at 448×448 using weights pretrained
-        at 224×224. Without this, patch positions would be wrong.
-
-        Args:
-            new_img_size: target image size (e.g. 448)
-            patch_size:   patch size (unchanged, e.g. 16)
+        Resize the row/col position tables for a different canvas size.
+        Call BEFORE building the optimizer (replaces parameters).
         """
-        old_n_patches = self.pos_embed.shape[1] - 1  # exclude CLS
-        new_n_patches = (new_img_size // patch_size) ** 2
-
-        if old_n_patches == new_n_patches:
-            return  # nothing to do
-
-        cls_pos  = self.pos_embed[:, :1, :]           # (1, 1, embed_dim) — keep CLS pos
-        patch_pos = self.pos_embed[:, 1:, :]           # (1, old_n, embed_dim)
-
-        # Interpolate patch positions on a 2D grid
-        old_grid = int(math.sqrt(old_n_patches))
-        new_grid = int(math.sqrt(new_n_patches))
-
-        # Reshape to (1, embed_dim, old_grid, old_grid), interpolate, reshape back
-        patch_pos = patch_pos.reshape(1, old_grid, old_grid, -1).permute(0, 3, 1, 2)
-        patch_pos = torch.nn.functional.interpolate(
-            patch_pos, size=(new_grid, new_grid), mode='bicubic', align_corners=False
-        )
-        patch_pos = patch_pos.permute(0, 2, 3, 1).reshape(1, new_n_patches, -1)
-
-        self.pos_embed = nn.Parameter(torch.cat([cls_pos, patch_pos], dim=1))
-        print(f"  Interpolated pos_embed: {old_grid}² → {new_grid}² patches")
+        new_grid = new_img_size // patch_size
+        if new_grid == self.grid:
+            return
+        def _interp(table):
+            t = table.t().unsqueeze(0)  # (1, dim, grid)
+            t = torch.nn.functional.interpolate(t, size=new_grid, mode="linear", align_corners=False)
+            return nn.Parameter(t.squeeze(0).t().contiguous())
+        self.row_embed = _interp(self.row_embed.data)
+        self.col_embed = _interp(self.col_embed.data)
+        self.grid = new_grid
+        self.patch_embed.n_patches = new_grid ** 2
+        print(f"  Resized pos tables → {new_grid}×{new_grid} grid")
 
 
-# ── default config (ViT-S/16) ─────────────────────────────────────────────────
+# ── default config (ViT-S/16 at 448) ──────────────────────────────────────────
 DEFAULT_CONFIG = dict(
-    img_size    = 224,
+    img_size    = 448,
     patch_size  = 16,
     in_channels = 3,
     embed_dim   = 384,
@@ -323,32 +298,24 @@ DEFAULT_CONFIG = dict(
 if __name__ == "__main__":
     model = VisionEncoder(**DEFAULT_CONFIG)
 
-    # Count parameters
     total  = sum(p.numel() for p in model.parameters())
     print(f"VisionEncoder (ViT-S/16) self-check")
     print(f"  params       : {total/1e6:.1f}M")
 
     n_patches = model.patch_embed.n_patches
-    print(f"  n_patches    : {n_patches}  ({int(n_patches**0.5)}×{int(n_patches**0.5)} grid)")
+    print(f"  n_patches    : {n_patches}  ({model.grid}×{model.grid} grid)")
 
-    # Forward pass
     B = 2
     images = torch.randn(B, 3, DEFAULT_CONFIG["img_size"], DEFAULT_CONFIG["img_size"])
     out    = model(images)
 
     expected_shape = (B, n_patches, DEFAULT_CONFIG["embed_dim"])
     assert out.shape == expected_shape, f"shape mismatch: {out.shape} != {expected_shape}"
-
     print(f"  input shape  : {tuple(images.shape)}")
     print(f"  output shape : {tuple(out.shape)}  ✅")
 
-    # Check CLS is dropped (output has n_patches tokens, not n_patches+1)
-    assert out.shape[1] == n_patches, "CLS token should be dropped from output"
-    print(f"  CLS dropped  : ✅  ({n_patches} patch tokens, not {n_patches+1})")
-
-    # Position interpolation test
-    print(f"\n  Testing position interpolation (224→448)...")
-    model.interpolate_pos_embed(new_img_size=448)
-    images_large = torch.randn(B, 3, 448, 448)
-    out_large    = model(images_large)
-    print(f"  448×448 output: {tuple(out_large.shape)}  ✅")
+    print(f"\n  Testing grid resize (448→224)...")
+    model.resize_grid(new_img_size=224)
+    out_small = model(torch.randn(B, 3, 224, 224))
+    assert out_small.shape == (B, 14 * 14, DEFAULT_CONFIG["embed_dim"])
+    print(f"  224×224 output: {tuple(out_small.shape)}  ✅")

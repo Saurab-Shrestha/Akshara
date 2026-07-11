@@ -78,17 +78,17 @@ class TextDataset(Dataset):
         # encode returns a plain list[int]; prepend BOS so the model learns to
         # start a document from scratch (important for generation at inference time).
         bos = self.tokenizer.bos_token_id or self.tokenizer.eos_token_id
+        eos = self.tokenizer.eos_token_id
         ids = [bos] + self.tokenizer.encode(text)
 
-        # Truncate to max_seq_len + 1 so we can shift to get both input and target.
-        ids = ids[: self.max_seq_len + 1]
+        # Truncate leaving room for one EOS, append it (documents end).
+        ids = ids[: self.max_seq_len] + [eos]
 
-        # Pad if shorter than max_seq_len + 1.
-        if len(ids) < self.max_seq_len + 1:
-            ids = ids + [self.pad_id] * (self.max_seq_len + 1 - len(ids))
-
-        input_ids = torch.tensor(ids[:-1], dtype=torch.long)   # [max_seq_len]
-        targets   = torch.tensor(ids[1:],  dtype=torch.long)   # [max_seq_len]
+        # Inputs pad with EOS (valid embeddable token); targets pad with -100
+        # so the loss never supervises "predict EOS given EOS" filler.
+        pad_len   = (self.max_seq_len + 1) - len(ids)
+        input_ids = torch.tensor((ids + [eos]  * pad_len)[:-1], dtype=torch.long)
+        targets   = torch.tensor((ids + [-100] * pad_len)[1:],  dtype=torch.long)
         return input_ids, targets
 
 

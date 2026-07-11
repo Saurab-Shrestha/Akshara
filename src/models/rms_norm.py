@@ -40,11 +40,12 @@ import torch.nn as nn
 
 class RMSNorm(nn.Module):
 
-    def __init__(self, dim: int, eps: float = 1e-8):
+    def __init__(self, dim: int, eps: float = 1e-5):
         """
         Args:
             dim: the size of the last dimension of the input tensor (= n_embed)
             eps: small value added before sqrt to avoid division by zero
+                 (1e-5: representable in bf16-scale statistics; 1e-8 is not)
         """
         super().__init__()
         self.eps = eps
@@ -58,15 +59,11 @@ class RMSNorm(nn.Module):
         Returns:
             normalized tensor, same shape as x
         """
-        # Compute RMS across the last dimension (each token independently)
-        # x.pow(2)          → square every element
-        # .mean(-1, keepdim=True) → average across dim, keep shape for broadcasting
-        # .add(self.eps)    → avoid sqrt(0)
-        # .rsqrt()          → 1/sqrt(x) — faster than sqrt then divide
-        rms_inv = x.pow(2).mean(-1, keepdim=True).add(self.eps).rsqrt()
-
-        # Normalize, then apply the learned scale γ
-        return self.weight * (x * rms_inv)
+        # Statistics in fp32 even under bf16 autocast (LLaMA-style):
+        # mean of 768 squares in bf16 loses precision and destabilizes training.
+        xf = x.float()
+        rms_inv = xf.pow(2).mean(-1, keepdim=True).add(self.eps).rsqrt()
+        return self.weight * (xf * rms_inv).type_as(x)
 
 
 # ── self-check ────────────────────────────────────────────────────────────────

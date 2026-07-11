@@ -22,3 +22,6 @@ tensorboard>=2.17.0
 
 # Dev
 ipykernel>=6.29.0
+
+# Inference pipeline only (layout + table structure) — not needed for training
+# surya-ocr>=0.8.0

@@ -117,7 +117,7 @@ def estimate_loss(
         targets   = targets.to(device)
         with amp_context(cfg.use_amp, cfg.amp_dtype, device):
             _, loss = model(input_ids, targets)
-        losses.append(loss.item())
+        losses.append(loss.mean().item())  # .mean(): DataParallel returns per-GPU losses
     model.train()
     return sum(losses) / max(1, len(losses))
 
@@ -272,7 +272,8 @@ def main() -> None:
 
             with amp_context(cfg.use_amp, cfg.amp_dtype, device):
                 _, loss = model(input_ids, targets)
-                loss = loss / cfg.grad_accum
+                # DataParallel returns one loss per GPU — reduce to scalar
+                loss = loss.mean() / cfg.grad_accum
 
             loss.backward()
             accum_loss += loss.item()
@@ -308,7 +309,6 @@ def main() -> None:
                 dev_loss = estimate_loss(model, dev_iter, cfg, cfg.eval_iters, device)
                 train_iter_eval = iter(train_loader)
                 train_loss = estimate_loss(model, train_iter_eval, cfg, cfg.eval_iters, device)
-                train_iter = iter(train_loader)
                 ppl = math.exp(min(dev_loss, 20))
                 print(f"  [eval] step {step} | train {train_loss:.4f} | dev {dev_loss:.4f} | ppl {ppl:.2f}")
                 writer.add_scalar("eval/train_loss", train_loss, step)
@@ -317,7 +317,8 @@ def main() -> None:
 
         # --- periodic checkpoint ---
         if step > start_step and step % cfg.save_every == 0:
-            save_checkpoint(cfg.out_ckpt, raw_model, optimizer, step, cfg)
+            # step+1: this step is done — resume should start at the next one
+            save_checkpoint(cfg.out_ckpt, raw_model, optimizer, step + 1, cfg)
             print(f"  [ckpt] saved → {cfg.out_ckpt} (step {step})")
 
     # --- final checkpoint ---

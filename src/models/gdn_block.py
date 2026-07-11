@@ -109,7 +109,10 @@ class GatedDeltaNetLayer(nn.Module):
 
         # α (alpha): forget gate — how much of old state to keep
         # One scalar per head per token → sigmoid → (0, 1)
-        self.w_alpha = nn.Linear(d_model, n_heads, bias=False)
+        # bias=+4 so alpha starts at sigmoid(4)≈0.98: memory survives ~50 tokens
+        # at init instead of halving every step (sigmoid(0)=0.5 → memoryless).
+        self.w_alpha = nn.Linear(d_model, n_heads, bias=True)
+        nn.init.constant_(self.w_alpha.bias, 4.0)
 
         # Output norm + projection (stabilizes the state output)
         self.out_norm = RMSNorm(d_model)
@@ -126,22 +129,25 @@ class GatedDeltaNetLayer(nn.Module):
         H, D = self.n_heads, self.d_head
 
         # Project to q, k, v  →  reshape to (B, T, H, D)
-        q = self.wq(x).view(B, T, H, D)
-        k = self.wk(x).view(B, T, H, D)
-        v = self.wv(x).view(B, T, H, D)
+        # The recurrence runs in fp32 even under bf16 autocast: the delta rule
+        # relies on near-cancellation (v − S·k), which bf16's 8-bit mantissa
+        # destroys over hundreds of steps.
+        q = self.wq(x).view(B, T, H, D).float()
+        k = self.wk(x).view(B, T, H, D).float()
+        v = self.wv(x).view(B, T, H, D).float()
 
         # L2-normalize k so the state matrix doesn't grow unboundedly
         # k is the "address" in memory — unit vectors work best as addresses
         k = F.normalize(k, dim=-1)
 
         # Gates: (B, T, H) → unsqueeze for broadcasting → (B, T, H, 1)
-        beta  = torch.sigmoid(self.w_beta(x)).unsqueeze(-1)   # update strength
-        alpha = torch.sigmoid(self.w_alpha(x)).unsqueeze(-1)  # forget strength
+        beta  = torch.sigmoid(self.w_beta(x)).unsqueeze(-1).float()   # update strength
+        alpha = torch.sigmoid(self.w_alpha(x)).unsqueeze(-1).float()  # forget strength
 
         # ── Sequential recurrence over time ──────────────────────────────────
         # S: (B, H, D, D) — the memory matrix, one per head per batch
         # Initialized to zero at the start of each sequence
-        S = torch.zeros(B, H, D, D, device=x.device, dtype=x.dtype)
+        S = torch.zeros(B, H, D, D, device=x.device, dtype=torch.float32)
 
         outputs = []
         for t in range(T):
@@ -175,8 +181,8 @@ class GatedDeltaNetLayer(nn.Module):
         # Stack time steps: list of T × (B, H, D)  →  (B, T, H, D)
         out = torch.stack(outputs, dim=1)
 
-        # Merge heads: (B, T, H, D) → (B, T, d_model)
-        out = out.contiguous().view(B, T, -1)
+        # Merge heads: (B, T, H, D) → (B, T, d_model), back to input dtype
+        out = out.contiguous().view(B, T, -1).type_as(x)
 
         # Normalize and project
         return self.wo(self.out_norm(out))

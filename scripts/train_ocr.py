@@ -132,19 +132,17 @@ def greedy_decode(model: Akshara, image_tensor: torch.Tensor, tokenizer, max_new
     eos = tokenizer.eos_token_id
     bos = tokenizer.bos_token_id or eos
 
-    # Start with BOS token.
-    tokens = torch.tensor([[bos]], dtype=torch.long, device=image_tensor.device)
+    # model.generate encodes the image ONCE (generate_step would re-run the
+    # vision encoder on every token — orders of magnitude slower).
+    tokens = model.generate(
+        image_tensor,
+        bos_token_id=bos,
+        eos_token_id=eos,
+        max_new_tokens=max_new,
+        temperature=0.0,
+    )
 
-    for _ in range(max_new):
-        logits = model.generate_step(image_tensor, tokens)   # [1, vocab]
-        next_tok = logits.argmax(dim=-1, keepdim=True)        # [1, 1]
-        tokens = torch.cat([tokens, next_tok], dim=1)
-        if next_tok.item() == eos:
-            break
-
-    # Strip BOS and EOS from the output ids before decoding.
-    ids = tokens[0].tolist()
-    ids = [t for t in ids if t not in (bos, eos)]
+    ids = [t for t in tokens[0].tolist() if t not in (bos, eos)]
     return tokenizer.decode(ids, skip_special_tokens=True)
 
 
@@ -169,12 +167,14 @@ def evaluate_cer(
         if i >= n_iters:
             break
         images = images.to(cfg.device)
-        # Decode only the first sample in the batch for speed.
+        # Decode only the first sample in the batch for speed; cap max_new
+        # (256 covers a paragraph crop — full max_seq_len would be an eval cost bomb).
         single_image = images[:1]
-        pred_text = greedy_decode(model, single_image, tokenizer, max_new=cfg.max_seq_len)
-        # Ground truth: decode target_ids[0], strip padding and HTML tags.
+        pred_text = greedy_decode(model, single_image, tokenizer,
+                                  max_new=min(256, cfg.max_seq_len))
+        # Ground truth: decode target_ids[0], strip -100 loss-mask padding and EOS.
         gt_ids = target_ids[0].tolist()
-        gt_ids = [t for t in gt_ids if t != tokenizer.eos_token_id]
+        gt_ids = [t for t in gt_ids if t >= 0 and t != tokenizer.eos_token_id]
         gt_text = _strip_html(tokenizer.decode(gt_ids, skip_special_tokens=True))
         pred_plain = _strip_html(pred_text)
         total_cer += _cer(pred_plain, gt_text)
@@ -347,7 +347,8 @@ def main() -> None:
 
             with amp_context(cfg.use_amp, cfg.amp_dtype, device):
                 _, loss = model(images, input_ids, target_ids)
-                loss = loss / cfg.grad_accum
+                # DataParallel returns one loss per GPU — reduce to scalar
+                loss = loss.mean() / cfg.grad_accum
 
             loss.backward()
             accum_loss += loss.item()
@@ -376,12 +377,14 @@ def main() -> None:
             writer.add_scalar("train/tok_per_sec", tok_s,            step)
 
         if step > start_step and step % cfg.eval_steps == 0 and dev_loader is not None:
-            cer = evaluate_cer(model, dev_loader, tokenizer, cfg, cfg.eval_iters)
+            # raw_model: DataParallel doesn't proxy custom methods (generate_step)
+            cer = evaluate_cer(raw_model, dev_loader, tokenizer, cfg, cfg.eval_iters)
             print(f"  [eval] step {step} | CER {cer:.4f} ({cer * 100:.2f}%)")
             writer.add_scalar("eval/cer", cer, step)
 
         if step > start_step and step % cfg.save_every == 0:
-            save_checkpoint(cfg.out_ckpt, raw_model, optimizer, step, cfg)
+            # step+1: this step is done — resume should start at the next one
+            save_checkpoint(cfg.out_ckpt, raw_model, optimizer, step + 1, cfg)
             print(f"  [ckpt] saved → {cfg.out_ckpt} (step {step})")
 
     save_checkpoint(cfg.out_ckpt, raw_model, optimizer, cfg.train_steps, cfg)

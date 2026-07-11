@@ -48,6 +48,8 @@ PARAMETER TOTAL
   Unique (tied)  : ~296M  (weight tying is inside HybridDecoder)
 """
 
+from __future__ import annotations
+
 import torch
 import torch.nn as nn
 
@@ -64,14 +66,14 @@ class Akshara(nn.Module):
     def __init__(
         self,
         # Vision encoder config (ViT-S/16)
-        img_size:    int = 224,
+        img_size:    int = 448,
         patch_size:  int = 16,
         in_channels: int = 3,
         vision_dim:  int = 384,
         vit_layers:  int = 12,
         vit_heads:   int = 6,
         # Decoder config
-        vocab_size:  int = 248_044,
+        vocab_size:  int = 248_077,
         n_embed:     int = 768,    # renamed from decoder_dim to match ModelConfig / HybridDecoder
         n_heads:     int = 12,
         n_kv_heads:  int = 3,
@@ -170,7 +172,7 @@ class Akshara(nn.Module):
         bos_token_id:   int,
         eos_token_id:   int,
         max_new_tokens: int = 256,
-        temperature:    float = 0.1,
+        temperature:    float = 0.0,
     ) -> torch.Tensor:
         """
         Run OCR inference on a batch of images.
@@ -180,7 +182,7 @@ class Akshara(nn.Module):
             bos_token_id:   start-of-sequence token
             eos_token_id:   stop generation when this token is produced
             max_new_tokens: safety limit on generated length
-            temperature:    0.1 = near-greedy (good for OCR verbatim accuracy)
+            temperature:    0.0 = greedy (default; right for verbatim OCR)
 
         Returns:
             token_ids: (batch, n_generated) — generated text token IDs
@@ -191,27 +193,41 @@ class Akshara(nn.Module):
         # Encode image once (no need to re-encode per generation step)
         patch_tokens  = self.encoder(images)
         visual_prefix = self.connector(patch_tokens)
+        n_visual      = visual_prefix.shape[1]
+
+        # Text budget: decoder positions cover visual prefix + text
+        max_text = self.decoder.max_seq_len
 
         # Start with just the BOS token
         token_ids = torch.full((B, 1), bos_token_id, dtype=torch.long, device=device)
+        finished  = torch.zeros(B, dtype=torch.bool, device=device)
 
         for _ in range(max_new_tokens):
-            ids_cond = token_ids[:, -self.decoder.max_seq_len:]
+            ids_cond = token_ids[:, -max_text:]
 
             logits, _ = self.decoder(
                 token_ids     = ids_cond,
                 vision_prefix = visual_prefix,
             )
 
-            # Sample next token from the last position
-            next_logits = logits[:, -1, :] / temperature
-            probs       = torch.softmax(next_logits, dim=-1)
-            next_id     = torch.multinomial(probs, num_samples=1)
+            next_logits = logits[:, -1, :]
+            if temperature <= 1e-6:
+                # Greedy — the right default for verbatim OCR
+                next_id = next_logits.argmax(dim=-1, keepdim=True)
+            else:
+                probs   = torch.softmax(next_logits / temperature, dim=-1)
+                next_id = torch.multinomial(probs, num_samples=1)
 
+            # Sequences that already emitted EOS keep emitting EOS
+            next_id = torch.where(
+                finished.unsqueeze(1),
+                torch.full_like(next_id, eos_token_id),
+                next_id,
+            )
             token_ids = torch.cat([token_ids, next_id], dim=1)
 
-            # Stop if all sequences in batch have produced EOS
-            if (next_id == eos_token_id).all():
+            finished |= next_id.squeeze(1) == eos_token_id
+            if finished.all():
                 break
 
         return token_ids
@@ -252,7 +268,7 @@ class Akshara(nn.Module):
 
 # ── default config ─────────────────────────────────────────────────────────────
 DEFAULT_CONFIG = dict(
-    img_size    = 224,
+    img_size    = 448,
     patch_size  = 16,
     in_channels = 3,
     vision_dim  = 384,
@@ -282,7 +298,7 @@ if __name__ == "__main__":
 
     # Forward pass (training mode)
     B, T = 2, 16
-    images    = torch.randn(B, 3, 224, 224)
+    images    = torch.randn(B, 3, 448, 448)
     token_ids = torch.randint(0, 1000, (B, T))
     targets   = torch.randint(0, 1000, (B, T))
 

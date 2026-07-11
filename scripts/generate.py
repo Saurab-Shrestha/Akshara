@@ -161,7 +161,7 @@ def main() -> None:
     # --- reconstruct model from saved config ---
     from src.models.vlm import Akshara
     model = Akshara(
-        vocab_size  = saved_config.get("vocab_size",  248044),
+        vocab_size  = saved_config.get("vocab_size",  248077),
         n_embed     = saved_config.get("n_embed",     768),
         n_heads     = saved_config.get("n_heads",     12),
         n_kv_heads  = saved_config.get("n_kv_heads",  3),

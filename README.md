@@ -1,43 +1,48 @@
 # Akshara (अक्षर)
 
-**अक्षर** — Sanskrit for *letter* and *imperishable*. An OCR model that reads Devanagari script and outputs structured HTML.
+**अक्षर** — Sanskrit for *letter* and *imperishable*. Nepali/Devanagari document OCR: page image in, structured `<p>`, `<h1>`, `<table>` HTML out.
 
-Full-page document understanding: a single image in, clean `<p>`, `<h1>`, `<table>` HTML out — no bounding boxes, no post-processing pipeline.
+Pretrained layout/table-structure models (Surya) find the *structure*; a custom-trained crop recognizer does the *reading*. Structure is geometry and language-agnostic — reading Devanagari is the only part that needs training, so it's the only part we train.
+
+**Full design doc: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** (flowcharts, rationale, data formats).
 
 ---
 
 ## Architecture
 
 ```
-Image (448×448)
+Page image
     │
     ▼
-ViT-S/16 Encoder          — 12 layers, 384-dim, 28×28 = 784 patches
+Surya layout + table structure (pretrained)   — paragraphs, headings, table cells
     │
-    ▼
-Connector (MLP)            — projects 384 → 768
+    ▼  region / cell crops (448×448, aspect-preserving pad)
     │
-    ▼
-Hybrid Decoder (12 layers) — alternates Transformer ↔ GDN blocks
-    │                        GQA (12 query / 3 KV heads), RoPE, bf16
-    ▼
-HTML output tokens         — <p>नेपाल...</p>, <h1>...</h1>, <table>...</table>
+Akshara recognizer (trained by us):
+    ViT-S/16 encoder       — 784 patches, factorized 2D positions
+    Connector (MLP+norm)   — 384 → 768
+    Hybrid decoder         — 12 layers, GDN:attention 3:1, GQA, RoPE
+    │
+    ▼  plain Nepali text per crop
+    │
+HTML assembler (plain Python)                 — region class → <p>/<h1>/<table>
 ```
 
-The decoder is a hybrid of standard Transformer blocks and GDN (Generalized Divisive Normalization) blocks, which model multiplicative interactions between features — useful for script with dense conjunct characters.
+The decoder alternates Gated DeltaNet (GDN) recurrence layers with full-attention "exact recall" layers at a 3:1 ratio.
 
-**Model size**: ~300M parameters (embedding-heavy due to 248k vocab)
+**Recognizer size**: ~296M parameters (190M is the 248k-vocab embedding table)
 
 ---
 
 ## Training
 
-Three stages, each building on the last:
+Curriculum: learn the language, learn to read a line, learn to read a paragraph (the line→paragraph warmup follows [Pix2Struct](https://arxiv.org/abs/2210.03347)'s reading-curriculum result):
 
 | Stage | What trains | Data | Goal |
 |---|---|---|---|
 | 1 — Language pretrain | Decoder only | Nepali Wikipedia / CulturaX | Learn Devanagari token patterns |
-| 2 — OCR fine-tune | Full model | RenderedText + CORD + IAM | Learn image → HTML mapping |
+| 2A — Line warmup | Full model | Synthetic single-line crops | Glyph-level reading (conjuncts, matras) |
+| 2B — Paragraph OCR | Full model | Synthetic multi-line crops | Multi-line reading |
 | 3 — Nepali fine-tune | Full model | Synthetic Nepali pages | Adapt to Devanagari documents |
 
 ---
@@ -66,21 +71,13 @@ wget -q 'https://github.com/googlefonts/noto-fonts/raw/main/hinted/ttf/NotoSansD
 ## Data Preparation
 
 ```bash
-# Nepali Wikipedia corpus (language pretrain)
+# Nepali Wikipedia corpus (Stage 1 language pretrain)
 PYTHONPATH=. python scripts/prepare_data.py --stage corpus --max_samples 200000
-
-# English OCR datasets (RenderedText + CORD receipts + IAM handwriting)
-PYTHONPATH=. python scripts/prepare_data.py --stage rendered --max_samples 100000
-PYTHONPATH=. python scripts/prepare_data.py --stage cord
-PYTHONPATH=. python scripts/prepare_data.py --stage iam
-
-# Synthetic Nepali document images
-PYTHONPATH=. python scripts/prepare_data.py --stage synth \
-    --font_path fonts/NotoSansDevanagari-Regular.ttf --n_synth 50000
-
-# Merge all OCR datasets into train/val
-PYTHONPATH=. python scripts/prepare_data.py --stage merge
 ```
+
+> ⚠️ Crop-dataset generation (Stages 2A/2B) is being rebuilt around the new
+> line→paragraph curriculum — see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) §3–4.
+> The old full-page `--stage rendered/cord/iam/synth/merge` paths are stale.
 
 ---
 
@@ -185,12 +182,11 @@ akshara/
 │   │   ├── connector.py        # Vision → decoder bridge (MLP)
 │   │   └── vlm.py              # Full Akshara model assembly
 │   ├── data/
-│   │   ├── ocr_dataset.py      # JSONL dataset loader
-│   │   ├── synth_data.py       # Synthetic Nepali page generator
+│   │   ├── ocr_dataset.py      # CropOCRDataset (aspect-preserving pad, -100 mask)
+│   │   ├── text_dataset.py     # Stage 1 corpus loader
+│   │   ├── synth_data.py       # Synthetic crop generator (being rebuilt)
 │   │   └── hf_dataset.py       # HuggingFace dataset loaders
-│   └── detection/
-│       ├── surya_detector.py   # Surya-based text region detection
-│       └── pipeline.py         # Full detection → recognition pipeline
+│   └── pipeline.py             # Surya layout → recognizer → HTML assembly
 ├── scripts/
 │   ├── prepare_data.py         # Data download + preparation
 │   ├── pretrain.py             # Stage 1: language pretraining

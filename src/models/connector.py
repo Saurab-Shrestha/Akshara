@@ -42,6 +42,8 @@ The connector is 0.6M params either way. No dead-neuron risk at this scale.
 import torch
 import torch.nn as nn
 
+from src.models.rms_norm import RMSNorm
+
 
 class Connector(nn.Module):
     """
@@ -70,6 +72,16 @@ class Connector(nn.Module):
             nn.Linear(hidden_dim, decoder_dim, bias=True),
         )
 
+        # Output norm: visual tokens must enter the decoder's residual stream
+        # at the same scale as text embeddings (std≈0.02 per dim). Without it
+        # the visual prefix arrives ~5× hotter and drowns out the text.
+        # RMSNorm output has per-dim RMS ≈ 1; token embeds have per-dim std 0.02,
+        # so init the learnable gain to 0.02 to match. It's learnable — the model
+        # can turn the visual signal up as training progresses.
+        self.out_norm = RMSNorm(decoder_dim)
+        with torch.no_grad():
+            self.out_norm.weight.fill_(0.02)
+
         self._init_weights()
 
     def _init_weights(self):
@@ -86,7 +98,7 @@ class Connector(nn.Module):
         Returns:
             (batch, n_patches, decoder_dim) — ready to prepend to decoder input
         """
-        return self.net(vision_tokens)
+        return self.out_norm(self.net(vision_tokens))
 
 
 # ── default config ────────────────────────────────────────────────────────────
