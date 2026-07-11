@@ -18,6 +18,12 @@ DECODING STRATEGY:
         latency by the beam width for typically marginal gain on printed Nepali text.
         Use beam search in post-processing if you need it.
 
+IMAGE PREPROCESSING:
+    Crop aspect ratios vary wildly (a line is 20:1, a table cell may be 1:2).
+    We apply the same aspect-preserving pad as the training pipeline
+    (src/data/ocr_dataset.py::pad_to_square) — never squash.  A squashed line
+    becomes unreadable; a padded one is not.
+
 USAGE:
     # Basic OCR:
     PYTHONPATH=. python scripts/generate.py \\
@@ -38,9 +44,11 @@ import argparse
 import os
 import sys
 
+import numpy as np
 import torch
 from PIL import Image
-from torchvision import transforms
+
+from src.data.ocr_dataset import pad_to_square
 
 # ImageNet normalisation — must match the training preprocessing in ocr_dataset.py.
 _IMAGENET_MEAN = [0.485, 0.456, 0.406]
@@ -51,20 +59,24 @@ def preprocess_image(image_path: str, img_size: int) -> torch.Tensor:
     """
     Load and preprocess a single image to match training preprocessing.
 
+    The key step is ``pad_to_square`` (aspect-preserving resize onto a white
+    canvas, never squash).  This is identical to the training pipeline —
+    crops with wildly different aspect ratios (20:1 line, 1:2 cell) stay
+    readable.
+
     Args:
         image_path: Path to the image file.
-        img_size:   Target square resolution (must match the model's img_size).
+        img_size:   Square canvas size (must match the model's img_size).
 
     Returns:
         FloatTensor [1, 3, img_size, img_size] ready for model input.
     """
-    transform = transforms.Compose([
-        transforms.Resize((img_size, img_size)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=_IMAGENET_MEAN, std=_IMAGENET_STD),
-    ])
     image = Image.open(image_path).convert("RGB")
-    return transform(image).unsqueeze(0)   # [1, 3, H, W]
+    image = pad_to_square(image, img_size)
+    arr   = np.asarray(image, dtype=np.float32).transpose(2, 0, 1) / 255.0
+    for c in range(3):
+        arr[c] = (arr[c] - _IMAGENET_MEAN[c]) / _IMAGENET_STD[c]
+    return torch.from_numpy(arr).unsqueeze(0)
 
 
 @torch.no_grad()
@@ -73,41 +85,35 @@ def generate(
     image_tensor: torch.Tensor,
     tokenizer,
     max_new_tokens: int = 256,
-    temperature: float = 0.1,
+    temperature: float = 0.0,
 ) -> str:
     """
     Autoregressively decode text from an image tensor.
+
+    Uses Akshara's GDN state-cached ``generate()`` — encodes the image
+    once, then decodes token-by-token with cached GDN memory states
+    (O(1) per step instead of O(T)).
 
     Args:
         model:          Akshara in eval mode.
         image_tensor:   [1, 3, H, W] preprocessed image on the model's device.
         tokenizer:      HuggingFace tokenizer.
         max_new_tokens: Maximum number of new tokens to generate.
-        temperature:    Sampling temperature.  0 or very small ≈ greedy.
+        temperature:    Sampling temperature.  0 = greedy (default for OCR).
 
     Returns:
         Decoded string (BOS/EOS stripped).
     """
-    bos = tokenizer.bos_token_id
+    bos = tokenizer.bos_token_id or tokenizer.eos_token_id
     eos = tokenizer.eos_token_id
 
-    tokens = torch.tensor([[bos]], dtype=torch.long, device=image_tensor.device)
-
-    for _ in range(max_new_tokens):
-        logits = model.generate_step(image_tensor, tokens)   # [1, vocab_size]
-
-        if temperature <= 1e-6:
-            # Pure greedy — fastest and most deterministic.
-            next_tok = logits.argmax(dim=-1, keepdim=True)
-        else:
-            # Temperature sampling.
-            probs = torch.softmax(logits / temperature, dim=-1)
-            next_tok = torch.multinomial(probs, num_samples=1)
-
-        tokens = torch.cat([tokens, next_tok], dim=1)
-
-        if next_tok.item() == eos:
-            break
+    tokens = model.generate(
+        image_tensor,
+        bos_token_id=bos,
+        eos_token_id=eos,
+        max_new_tokens=max_new_tokens,
+        temperature=temperature,
+    )
 
     ids = tokens[0].tolist()
     ids = [t for t in ids if t not in (bos, eos)]
@@ -127,8 +133,8 @@ def main() -> None:
         help="Path to the input image file"
     )
     parser.add_argument(
-        "--temperature", type=float, default=0.1,
-        help="Sampling temperature (0 = greedy; default: 0.1)"
+        "--temperature", type=float, default=0.0,
+        help="Sampling temperature (0 = greedy; default: 0.0)"
     )
     parser.add_argument(
         "--save_txt", action="store_true",

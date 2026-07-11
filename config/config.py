@@ -35,9 +35,9 @@ class ModelConfig:
     These must stay identical across all stages because loading a pretrained
     checkpoint into a fine-tuning run requires the same model topology.
 
-    DECODER (HybridDecoder, ~273M params):
+    DECODER (HybridDecoder, ~308M params):
         - n_embed=768, n_heads=12, n_kv_heads=3 (GQA 4:1 compression)
-        - n_layers=12, attn_every=4  → 9 GDN blocks + 3 attention blocks (3:1 ratio)
+        - n_layers=16, attn_every=4  → 12 GDN blocks + 4 attention blocks (3:1 ratio)
         - max_seq_len=512  (fits a full A4 page of dense Nepali text)
 
     VISION ENCODER (ViT-S/16, ~21.6M params):
@@ -53,7 +53,7 @@ class ModelConfig:
     n_embed: int = 768                # model dimension (residual stream width)
     n_heads: int = 12                 # number of query heads
     n_kv_heads: int = 3               # GQA: 12/3=4 queries share each KV head
-    n_layers: int = 12                # total decoder layers
+    n_layers: int = 16                # total decoder layers
     max_seq_len: int = 512            # text tokens per crop (a dense paragraph fits)
     attn_every: int = 4               # full attention every N layers; others use GDN
 
@@ -65,6 +65,9 @@ class ModelConfig:
     vit_heads: int = 6                # (informational)
     vit_pretrained: bool = True       # init from facebook/dinov2-small weights
 
+    # FLA (Flash Linear Attention) — GPU-accelerated GDN kernel
+    use_fla: bool = False             # set True if flash-linear-attention is installed
+
 
 # ---------------------------------------------------------------------------
 # Stage 1: Language pretraining (text-only)
@@ -73,23 +76,28 @@ class ModelConfig:
 @dataclass
 class PretrainConfig(ModelConfig):
     """
-    Configuration for language-only pretraining on the Nepali text corpus.
+    Configuration for language-only pretraining with SmolLM-style data approach.
 
     WHY text-only first:
         Training the decoder on language before attaching the vision encoder
-        gives it a strong prior on Nepali syntax and script. When OCR fine-tuning
+        gives it a strong prior on Devanagari syntax and script. When OCR fine-tuning
         starts, the model already knows how to produce valid Unicode Devanagari —
         the vision side only needs to learn *which* characters, not *what* characters
         look like in general.
 
+    DATA APPROACH (SmolLM-inspired):
+        Primary: FineWeb-2 (multilingual Devanagari: ne, hi, mr, sa) with quality filtering
+        English: FineWeb-Edu (education-filtered, English only)
+        Supplement: Wikipedia for all target languages
+        Quality: EduScore >= 3 filtering on web data
+
     BATCH MATH (T4 16GB):
-        batch_size=16, grad_accum=4 → effective_batch=64 sequences of 512 tokens
-        = 32,768 tokens per optimizer step.  At bf16, the decoder alone uses ~2GB,
-        leaving headroom for activations and gradients.
+        batch_size=2, grad_accum=8 → effective_batch=16 sequences of 512 tokens
+        = 8,192 tokens per optimizer step.  fp32 (T4 doesn't support bf16 natively).
 
     LR SCHEDULE: cosine decay with warmup.
-        warmup_steps=2000 (4% of train_steps) prevents early divergence on a
-        freshly initialised model.  min_lr=3e-5 is 10% of peak — standard ratio.
+        warmup_steps=500 prevents early divergence.
+        min_lr=3e-5 is 10% of peak — standard ratio.
     """
 
     # Data paths (overridden by JSON / CLI)
@@ -121,10 +129,18 @@ class PretrainConfig(ModelConfig):
     amp_dtype: Optional[str] = "bf16"          # "bf16" or "fp16"; None = disabled
     use_gradient_checkpointing: bool = True     # recomputes activations in backward
 
+    # Compilation
+    compile: bool = False                # torch.compile — fuses GDN loop via Triton
+
     # Misc
     seed: int = 42
     device: str = "cuda"
     log_dir: str = "logs/pretrain"
+
+    # Durable backup: if set (e.g. "username/akshara-pretrain"), every saved
+    # checkpoint is also uploaded to this HF Hub repo. Survives the training
+    # machine dying. Requires `huggingface-cli login` on the box first.
+    hf_repo: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------

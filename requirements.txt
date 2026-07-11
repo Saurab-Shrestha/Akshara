@@ -25,3 +25,8 @@ ipykernel>=6.29.0
 
 # Inference pipeline only (layout + table structure) — not needed for training
 # surya-ocr>=0.8.0
+
+# FLA (Flash Linear Attention) — GDN Triton kernel for GPU training. 10-50× faster
+# than the pure-Python recurrence in gdn_block.py.  Install on Kaggle T4:
+#   pip install flash-linear-attention
+# fla>=1.0.0

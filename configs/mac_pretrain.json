@@ -1,0 +1,19 @@
+{
+  "_comment": "macOS pretrain config — reduced model to fit MPS throughput. n_embed=384, 8 layers, seq_len=256.",
+  "n_embed": 384,
+  "n_heads": 6,
+  "n_kv_heads": 2,
+  "n_layers": 8,
+  "max_seq_len": 256,
+  "attn_every": 4,
+  "batch_size": 4,
+  "grad_accum": 2,
+  "train_steps": 10000,
+  "eval_steps": 500,
+  "warmup_steps": 500,
+  "lr": 3e-4,
+  "min_lr": 3e-5,
+  "device": "mps",
+  "out_ckpt": "checkpoints/pretrain_mac.pt",
+  "log_dir": "logs/pretrain_mac"
+}

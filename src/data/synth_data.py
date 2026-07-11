@@ -1,6 +1,18 @@
 """
-Synthetic crop generator — Nepali text → (crop image, text) pairs
-==================================================================
+Synthetic crop generator — Nepali/English text → (crop image, text) pairs
+==========================================================================
+
+LANGUAGES: the target is mainly Devanagari + English. Feed a mixed-language
+corpus (prepare_data.py --stage corpus downloads 70% Nepali / 30% English
+Wikipedia) and crops come out in either language; 20% of crops additionally
+splice a fragment from a second document to produce code-switched lines
+(English names/numbers inside Nepali text — the realistic hard case).
+
+FONTS: drop any mix of .ttf/.otf/.ttc files in the fonts dir. Each font's
+script coverage (Devanagari / Latin) is detected from its cmap at startup,
+and mixed-script text is rendered run-by-run with a matching font — no
+single font needs to cover both scripts, and tofu boxes are impossible.
+You need at least one font per script.
 
 THE CURRICULUM KNOB (docs/ARCHITECTURE.md §3)
 ----------------------------------------------
@@ -115,6 +127,15 @@ def render_crop(
     # Fill lines word-by-word; the label is what actually fits
     probe = ImageDraw.Draw(Image.new("RGB", (8, 8)))
     words = sample_words(texts, rng, n_words=n_lines * 14)
+
+    # Code-switching: real Nepali documents mix in English names, numbers
+    # and phrases constantly. With a mixed ne+en corpus, splicing a fragment
+    # from a second random document produces cross-script crops — the case
+    # the recognizer must handle, not just script-pure lines.
+    if rng.random() < 0.2:
+        frag = sample_words(texts, rng, rng.randint(1, 4))
+        pos  = rng.randrange(len(words) + 1)
+        words[pos:pos] = frag
     lines: list[str] = []
     cur = ""
     for w in words:
@@ -181,10 +202,15 @@ def generate(
     from PIL import features
     if not features.check("raqm"):
         raise RuntimeError(
-            "PIL lacks libraqm — Devanagari will render with broken matra/"
-            "conjunct shaping. Install with: pip install pillow --no-binary "
-            ":all: (after `apt install libraqm-dev`) or use a Pillow wheel "
-            "with raqm support.")
+            "PIL lacks libraqm — Devanagari matras/conjuncts will render in wrong\n"
+            "positions, silently corrupting every training label.\n\n"
+            "Installation:\n"
+            "  macOS: brew install harfbuzz fribidi && pip install pillow --no-binary :all:\n"
+            "  Linux: apt install libraqm-dev && pip install pillow --no-binary :all:\n"
+            "  Kaggle: apt-get update && apt-get install -y libraqm-dev &&\n"
+            "          pip install pillow --no-binary :all:\n\n"
+            "Verify: python -c 'from PIL import features; print(features.check(\"raqm\"))'\n"
+            "        → should print True")
 
     rng   = random.Random(seed)
     texts = load_corpus(corpus)

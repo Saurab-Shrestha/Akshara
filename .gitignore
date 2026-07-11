@@ -27,6 +27,7 @@ checkpoints/
 
 # Training data (large, downloaded on the fly)
 data/corpus/
+data/corpus*/
 data/synthetic/
 data/documents/
 data/hf_cache/

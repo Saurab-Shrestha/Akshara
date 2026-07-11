@@ -81,6 +81,7 @@ class Akshara(nn.Module):
         n_layers:    int = 12,
         max_seq_len: int = 512,
         attn_every:  int = 4,
+        use_fla:     bool = False,
     ):
         super().__init__()
 
@@ -107,6 +108,7 @@ class Akshara(nn.Module):
             n_layers    = n_layers,
             max_seq_len = max_seq_len,
             attn_every  = attn_every,
+            use_fla     = use_fla,
         )
 
     def forward(
@@ -179,6 +181,11 @@ class Akshara(nn.Module):
         """
         Run OCR inference on a batch of images.
 
+        Uses GDN state-cached generation: the visual prefix is encoded
+        once, then each decode step processes only the new token through
+        GDN layers (O(1) per step instead of O(T)). Attention layers
+        still attend to the full accumulated sequence.
+
         Args:
             images:         (batch, 3, img_size, img_size)
             bos_token_id:   start-of-sequence token
@@ -192,45 +199,17 @@ class Akshara(nn.Module):
         B = images.shape[0]
         device = images.device
 
-        # Encode image once (no need to re-encode per generation step)
         patch_tokens  = self.encoder(images)
         visual_prefix = self.connector(patch_tokens)
-        n_visual      = visual_prefix.shape[1]
+        token_ids    = torch.full((B, 1), bos_token_id, dtype=torch.long, device=device)
 
-        # Text budget: decoder positions cover visual prefix + text
-        max_text = self.decoder.max_seq_len
-
-        # Start with just the BOS token
-        token_ids = torch.full((B, 1), bos_token_id, dtype=torch.long, device=device)
-        finished  = torch.zeros(B, dtype=torch.bool, device=device)
-
-        for _ in range(max_new_tokens):
-            ids_cond = token_ids[:, -max_text:]
-
-            logits, _ = self.decoder(
-                token_ids     = ids_cond,
-                vision_prefix = visual_prefix,
-            )
-
-            next_logits = logits[:, -1, :]
-            if temperature <= 1e-6:
-                # Greedy — the right default for verbatim OCR
-                next_id = next_logits.argmax(dim=-1, keepdim=True)
-            else:
-                probs   = torch.softmax(next_logits / temperature, dim=-1)
-                next_id = torch.multinomial(probs, num_samples=1)
-
-            # Sequences that already emitted EOS keep emitting EOS
-            next_id = torch.where(
-                finished.unsqueeze(1),
-                torch.full_like(next_id, eos_token_id),
-                next_id,
-            )
-            token_ids = torch.cat([token_ids, next_id], dim=1)
-
-            finished |= next_id.squeeze(1) == eos_token_id
-            if finished.all():
-                break
+        token_ids = self.decoder.generate_cached(
+            vision_prefix  = visual_prefix,
+            token_ids      = token_ids,
+            max_new_tokens = max_new_tokens,
+            temperature    = temperature,
+            eos_token_id   = eos_token_id,
+        )
 
         return token_ids
 

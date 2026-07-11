@@ -1,5 +1,5 @@
 """
-Gated DeltaNet Block
+l
 =====================
 
 WHY THIS EXISTS
@@ -80,6 +80,14 @@ import torch.nn.functional as F
 from src.models.rms_norm import RMSNorm
 from src.models.swiglu import SwiGLU
 
+# Optional: FLA chunked Triton kernel for GDN (fast on GPU, not needed on CPU/Mac).
+# Install with: pip install flash-linear-attention
+try:
+    from fla.layers import GatedDeltaNet as _FLA_GatedDeltaNet
+    _HAS_FLA = True
+except ImportError:
+    _HAS_FLA = False
+
 
 class GatedDeltaNetLayer(nn.Module):
     """
@@ -87,16 +95,32 @@ class GatedDeltaNetLayer(nn.Module):
     Input/output shape: (batch, seq_len, d_model)  [same as attention]
     """
 
-    def __init__(self, d_model: int, n_heads: int):
+    def __init__(self, d_model: int, n_heads: int, use_fla: bool = False):
         """
         Args:
             d_model:  embedding dimension
             n_heads:  number of parallel memory heads
+            use_fla:  if True and flash-linear-attention is installed,
+                      use FLA's chunked Triton kernel instead of the
+                      pure-Python recurrence (much faster on GPU).
         """
         super().__init__()
         assert d_model % n_heads == 0
         self.n_heads = n_heads
         self.d_head  = d_model // n_heads
+        self.use_fla = use_fla and _HAS_FLA
+
+        if self.use_fla:
+            self._fla_layer = _FLA_GatedDeltaNet(
+                mode="chunk",
+                hidden_size=d_model,
+                head_dim=d_model // n_heads,
+                num_heads=n_heads,
+                expand_v=1.0,
+                use_gate=True,
+                use_short_conv=False,
+            )
+            return
 
         # Project input to q, k, v — same as attention
         self.wq = nn.Linear(d_model, d_model, bias=False)
@@ -118,74 +142,97 @@ class GatedDeltaNetLayer(nn.Module):
         self.out_norm = RMSNorm(d_model)
         self.wo       = nn.Linear(d_model, d_model, bias=False)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, state: dict | None = None) -> torch.Tensor:
         """
+        Full-sequenze forward with initial state (for training or prefill).
+
+        When ``use_fla=True`` and FLA is installed, delegates to FLA's
+        chunked Triton kernel for much faster GPU training.
+
         Args:
-            x: (batch, seq_len, d_model)
+            x:     (batch, seq_len, d_model)
+            state: optional dict with 'S' — (B, H, D, D) initial memory.
+                   If None, starts from zero (standard training path).
         Returns:
             (batch, seq_len, d_model)
         """
+        if self.use_fla:
+            out, _, _ = self._fla_layer(x)
+            if getattr(self, '_capture_state', False):
+                self._final_state = None
+            return out
+
         B, T, _ = x.shape
         H, D = self.n_heads, self.d_head
 
-        # Project to q, k, v  →  reshape to (B, T, H, D)
-        # The recurrence runs in fp32 even under bf16 autocast: the delta rule
-        # relies on near-cancellation (v − S·k), which bf16's 8-bit mantissa
-        # destroys over hundreds of steps.
         q = self.wq(x).view(B, T, H, D).float()
         k = self.wk(x).view(B, T, H, D).float()
         v = self.wv(x).view(B, T, H, D).float()
-
-        # L2-normalize k so the state matrix doesn't grow unboundedly
-        # k is the "address" in memory — unit vectors work best as addresses
         k = F.normalize(k, dim=-1)
+        beta  = torch.sigmoid(self.w_beta(x)).unsqueeze(-1).float()
+        alpha = torch.sigmoid(self.w_alpha(x)).unsqueeze(-1).float()
 
-        # Gates: (B, T, H) → unsqueeze for broadcasting → (B, T, H, 1)
-        beta  = torch.sigmoid(self.w_beta(x)).unsqueeze(-1).float()   # update strength
-        alpha = torch.sigmoid(self.w_alpha(x)).unsqueeze(-1).float()  # forget strength
-
-        # ── Sequential recurrence over time ──────────────────────────────────
-        # S: (B, H, D, D) — the memory matrix, one per head per batch
-        # Initialized to zero at the start of each sequence
-        S = torch.zeros(B, H, D, D, device=x.device, dtype=torch.float32)
+        S = (state['S'].float() if state is not None and 'S' in state
+             else torch.zeros(B, H, D, D, device=x.device, dtype=torch.float32))
 
         outputs = []
         for t in range(T):
-            kt = k[:, t]     # (B, H, D)
-            vt = v[:, t]     # (B, H, D)
-            qt = q[:, t]     # (B, H, D)
-            bt = beta[:, t]  # (B, H, 1)
-            at = alpha[:, t] # (B, H, 1)
-
-            # What does S currently associate with kt?
-            # S: (B, H, D, D), kt: (B, H, D) → (B, H, D, 1) → squeeze → (B, H, D)
-            S_kt = torch.matmul(S, kt.unsqueeze(-1)).squeeze(-1)  # (B, H, D)
-
-            # Delta update: erase S's current kt-memory, write vt instead
-            # outer product: (B, H, D, 1) @ (B, H, 1, D) = (B, H, D, D)
+            kt = k[:, t]; vt = v[:, t]; qt = q[:, t]
+            bt = beta[:, t]; at = alpha[:, t]
+            S_kt = torch.matmul(S, kt.unsqueeze(-1)).squeeze(-1)
             delta = torch.matmul(
-                (vt - S_kt).unsqueeze(-1),  # (B, H, D, 1)
-                kt.unsqueeze(-2)             # (B, H, 1, D)
-            )
+                (vt - S_kt).unsqueeze(-1), kt.unsqueeze(-2))
+            S = at.unsqueeze(-1) * S + bt.unsqueeze(-1) * delta
+            outputs.append(torch.matmul(S, qt.unsqueeze(-1)).squeeze(-1))
 
-            # Gated state update:
-            # α scales old state (forget), β scales the new delta (write)
-            # at, bt: (B, H, 1) → unsqueeze → (B, H, 1, 1) for matrix broadcast
-            S = at.unsqueeze(-1) * S + bt.unsqueeze(-1) * delta  # (B, H, D, D)
-
-            # Read: project current state onto the query direction
-            ot = torch.matmul(S, qt.unsqueeze(-1)).squeeze(-1)  # (B, H, D)
-
-            outputs.append(ot)
-
-        # Stack time steps: list of T × (B, H, D)  →  (B, T, H, D)
         out = torch.stack(outputs, dim=1)
-
-        # Merge heads: (B, T, H, D) → (B, T, d_model), back to input dtype
         out = out.contiguous().view(B, T, -1).type_as(x)
 
-        # Normalize and project
+        if getattr(self, '_capture_state', False):
+            self._final_state = {'S': S.detach().clone()}
+
         return self.wo(self.out_norm(out))
+
+    @torch.no_grad()
+    def step(self, x_t: torch.Tensor, state: dict | None = None) -> tuple[torch.Tensor, dict]:
+        """
+        Single-timestep forward for autoregressive decoding.
+
+        Processes one token through the GDN recurrence, updating the
+        memory matrix S in-place.  This is O(1) per step (vs O(T) for
+        the full forward loop).
+
+        Falls back to the pure-Python recurrence in all cases (FLA's
+        kernel does not expose a single-step interface).
+
+        Args:
+            x_t:   (B, d_model) — single token embedding
+            state: dict with 'S' (B, H, D, D) or None (starts zero)
+
+        Returns:
+            (output_t, new_state) where output_t is (B, d_model)
+        """
+        B = x_t.shape[0]
+        H, D = self.n_heads, self.d_head
+
+        q_t = self.wq(x_t).view(B, H, D).float()
+        k_t = self.wk(x_t).view(B, H, D).float()
+        v_t = self.wv(x_t).view(B, H, D).float()
+        k_t = F.normalize(k_t, dim=-1)
+        beta_t  = torch.sigmoid(self.w_beta(x_t)).unsqueeze(-1).float()
+        alpha_t = torch.sigmoid(self.w_alpha(x_t)).unsqueeze(-1).float()
+
+        S = (state['S'].float() if state is not None and 'S' in state
+             else torch.zeros(B, H, D, D, device=x_t.device, dtype=torch.float32))
+
+        S_kt = torch.matmul(S, k_t.unsqueeze(-1)).squeeze(-1)
+        delta = torch.matmul((v_t - S_kt).unsqueeze(-1), k_t.unsqueeze(-2))
+        S = alpha_t.unsqueeze(-1) * S + beta_t.unsqueeze(-1) * delta
+
+        o_t = torch.matmul(S, q_t.unsqueeze(-1)).squeeze(-1)
+        out = o_t.reshape(B, -1).type_as(x_t)
+        out = self.wo(self.out_norm(out))
+        return out, {'S': S}
 
 
 class GDNBlock(nn.Module):
@@ -194,32 +241,55 @@ class GDNBlock(nn.Module):
     Drop-in replacement for TransformerBlock in the 3:1 hybrid decoder.
     """
 
-    def __init__(self, n_embed: int, n_heads: int):
+    def __init__(self, n_embed: int, n_heads: int, use_fla: bool = False):
         """
         Args:
             n_embed:  embedding dimension
             n_heads:  number of GDN memory heads
+            use_fla:  use FLA Triton kernel if available (GPU training speedup)
         """
         super().__init__()
         self.norm1 = RMSNorm(n_embed)
-        self.gdn   = GatedDeltaNetLayer(n_embed, n_heads)
+        self.gdn   = GatedDeltaNetLayer(n_embed, n_heads, use_fla=use_fla)
         self.norm2 = RMSNorm(n_embed)
         self.mlp   = SwiGLU(n_embed)
 
-    def forward(self, x: torch.Tensor, cos: torch.Tensor = None, sin: torch.Tensor = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, cos: torch.Tensor = None, sin: torch.Tensor = None,
+                state: dict | None = None) -> torch.Tensor:
         """
+        Full-sequence forward.  Accepts optional initial GDN state.
+
+        When ``_capture_state`` is set on the GDN layer before calling, the
+        final memory state is saved in ``_final_state`` for cached generation.
+
         Args:
             x:         (batch, seq_len, n_embed)
-            cos, sin:  unused (GDN doesn't use RoPE). Accepted for interface
-                       compatibility with TransformerBlock.
+            cos, sin:  unused (interface compat with TransformerBlock)
+            state:     optional GDN state dict from a prior forward
+
         Returns:
             (batch, seq_len, n_embed)
         """
-        # GDN sub-layer with residual
-        x = x + self.gdn(self.norm1(x))
-        # MLP sub-layer with residual
+        x = x + self.gdn(self.norm1(x), state=state)
         x = x + self.mlp(self.norm2(x))
         return x
+
+    @torch.no_grad()
+    def step(self, x_t: torch.Tensor, state: dict | None = None) -> tuple[torch.Tensor, dict]:
+        """
+        Single-timestep forward for autoregressive decoding.
+
+        Args:
+            x_t:   (B, n_embed) — single token
+            state: GDN state dict or None
+
+        Returns:
+            (output_t, new_state)
+        """
+        gdn_out, new_state = self.gdn.step(self.norm1(x_t), state)
+        x_t = x_t + gdn_out
+        x_t = x_t + self.mlp(self.norm2(x_t))
+        return x_t, new_state
 
 
 # ── self-check ────────────────────────────────────────────────────────────────

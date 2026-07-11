@@ -1,35 +1,34 @@
 """
-Data preparation script — downloads and formats all training data.
+Data preparation for Akshara — SmolLM-style quality-centric approach.
 
-STAGES
-------
-  corpus     Download Nepali Wikipedia → data/corpus/{train,val}.jsonl
-             Used by scripts/pretrain.py for language pretraining.
+Downloads and mixes multilingual text corpora with education-quality filtering.
 
-  rendered   Download HuggingFaceM4/RenderedText → data/documents/
-             Clean rendered-text images, good first OCR dataset.
+SOURCES:
+    FineWeb-2:    Multilingual web with quality scores.
+                  Primary source for Devanagari script languages.
+    FineWeb-Edu:  Education-filtered English web (EduScore >= 3).
+    Wikipedia:    Clean articles for all target languages (supplement).
 
-  cord       Download CORD-v2 receipt dataset → data/documents/
-             Teaches the model HTML table output for forms/invoices.
+QUALITY FILTER:
+    FineWeb-2: length-filtered only. FineWeb-2 exposes no single EduScore
+               field, so QUALITY_THRESHOLD does not apply here.
+    FineWeb-Edu: score >= QUALITY_THRESHOLD (EduScore 0-5).
+    Wikipedia: no filtering (already curated).
 
-  iam        Download IAM handwriting dataset → data/documents/
-             Teaches robustness to non-printed / degraded text.
+DATA MIX (1M docs default):
+    70%  FineWeb-2 Devanagari (ne, hi, mr, sa)
+    20%  FineWeb-Edu          (English, high-quality)
+    10%  Wikipedia            (mixed ne, hi, en, mr, sa)
 
-  synth      Generate synthetic Nepali document images → data/documents/nepali/
-             Requires a Devanagari font (see --font_path).
+USAGE:
+    # Default 1M docs
+    PYTHONPATH=. python scripts/prepare_data.py
 
-  all        Run corpus + rendered + cord + iam (no synth — font needed separately)
+    # Custom size
+    PYTHONPATH=. python scripts/prepare_data.py --max_samples 500000 --out_dir data/corpus_v4
 
-USAGE
-------
-  # On Kaggle / first time setup:
-  python scripts/prepare_data.py --stage all
-
-  # Nepali synthetic data (after downloading font):
-  python scripts/prepare_data.py --stage synth --font_path fonts/NotoSansDevanagari-Regular.ttf
-
-  # Single stage:
-  python scripts/prepare_data.py --stage corpus --max_samples 100000
+    # Custom quality threshold
+    PYTHONPATH=. python scripts/prepare_data.py --quality 4
 """
 
 from __future__ import annotations
@@ -40,261 +39,222 @@ import os
 import random
 from pathlib import Path
 
+# Minimum EduScore quality threshold (0–5, higher = more educational)
+QUALITY_THRESHOLD = 3
 
-# ── corpus ──────────────────────────────────────────────────────────────────────
+# FineWeb-2 configs for Devanagari script languages
+_FINEWEB2_DEVANAGARI = {
+    "ne": "npi_Deva",
+    "hi": "hin_Deva",
+    "mr": "mar_Deva",
+    "sa": "san_Deva",
+}
 
-def prepare_corpus(max_samples: int = 200_000, val_ratio: float = 0.02):
-    """Download Nepali Wikipedia and split into train/val JSONL."""
-    print("\n=== Nepali corpus (Wikipedia) ===")
+# Wikipedia language codes
+_WIKI_CONFIGS = {
+    "ne": "20231101.ne",
+    "hi": "20231101.hi",
+    "en": "20231101.en",
+    "mr": "20231101.mr",
+    "sa": "20231101.sa",
+}
+
+
+def _load_fineweb2(config: str, max_samples: int) -> list[str]:
+    """Load documents from FineWeb-2 (length-filtered; no EduScore field)."""
     from datasets import load_dataset
 
-    os.makedirs("data/corpus", exist_ok=True)
-    train_path = "data/corpus/train.jsonl"
-    val_path   = "data/corpus/val.jsonl"
+    try:
+        ds = load_dataset(
+            "HuggingFaceFW/fineweb-2", config, split="train", streaming=True,
+        )
+    except Exception as e:
+        print(f"    [warn] cannot load FineWeb-2 '{config}': {e}")
+        return []
 
-    if os.path.exists(train_path):
-        print(f"  already exists: {train_path} — skipping")
-        return
-
-    print(f"  downloading up to {max_samples:,} articles…")
-    ds = load_dataset(
-        "wikimedia/wikipedia", "20231101.ne",
-        split="train", streaming=True, trust_remote_code=True,
-    )
-
-    lines = []
-    for i, row in enumerate(ds):
-        if i >= max_samples:
+    texts: list[str] = []
+    it = iter(ds)
+    i = 0
+    while len(texts) < max_samples:
+        try:
+            sample = next(it)
+        except StopIteration:
             break
-        text = row["text"].strip()
-        if len(text) < 50:
+        except Exception as e:
+            if "Cast" in type(e).__name__ or "Schema" in type(e).__name__:
+                continue
+            raise
+        i += 1
+        text = sample.get("text")
+        if text is None:
             continue
-        lines.append(json.dumps({"text": text}, ensure_ascii=False))
-        if (i + 1) % 10_000 == 0:
-            print(f"  {i + 1:,} articles loaded")
-
-    random.shuffle(lines)
-    n_val = max(1, int(len(lines) * val_ratio))
-
-    with open(val_path,   "w", encoding="utf-8") as f:
-        f.write("\n".join(lines[:n_val]))
-    with open(train_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines[n_val:]))
-
-    print(f"  {len(lines) - n_val:,} train + {n_val:,} val → data/corpus/")
+        text = text.strip()
+        if len(text) >= 50:
+            texts.append(text)
+        if i % 10000 == 0:
+            print(f"    ... {i} scanned, {len(texts)} kept")
+    return texts
 
 
-# ── rendered text ────────────────────────────────────────────────────────────────
+def _load_fineweb_edu(
+    max_samples: int, min_quality: int,
+) -> list[str]:
+    """Load English documents from FineWeb-Edu filtered by EduScore."""
+    from datasets import load_dataset
 
-def prepare_rendered(max_samples: int = 100_000):
-    """Download HuggingFaceM4/RenderedText → JSONL."""
-    print("\n=== RenderedText ===")
-    from src.data.hf_dataset import load_rendered_text, write_jsonl
-    from src.data.ocr_dataset import generate_split
-
-    out_dir  = "data/documents/rendered_text"
-    jsonl    = f"{out_dir}.jsonl"
-    if os.path.exists(jsonl):
-        print(f"  already exists: {jsonl} — skipping")
-        return
-
-    records = load_rendered_text(max_samples=max_samples, cache_dir="data/hf_cache")
-    write_jsonl(records, jsonl)
-    generate_split(jsonl, val_ratio=0.05)
-
-
-def prepare_cord():
-    """Download CORD-v2 receipt dataset → JSONL."""
-    print("\n=== CORD-v2 (receipts / tables) ===")
-    from src.data.hf_dataset import load_cord, write_jsonl
-    from src.data.ocr_dataset import generate_split
-
-    for split in ("train", "validation"):
-        tag   = "val" if split == "validation" else "train"
-        jsonl = f"data/documents/cord_{tag}.jsonl"
-        if os.path.exists(jsonl):
-            print(f"  already exists: {jsonl} — skipping")
-            continue
-        records = load_cord(cache_dir="data/hf_cache", split=split)
-        write_jsonl(records, jsonl)
-
-    # Merge train+val into one file, then re-split deterministically
-    _merge_and_split("data/documents/cord_train.jsonl",
-                     "data/documents/cord_val.jsonl",
-                     "data/documents/cord.jsonl")
-
-
-def prepare_iam():
-    """Download IAM handwriting dataset → JSONL."""
-    print("\n=== IAM handwriting ===")
-    from src.data.hf_dataset import load_iam, write_jsonl
-    from src.data.ocr_dataset import generate_split
-
-    jsonl = "data/documents/iam.jsonl"
-    if os.path.exists(jsonl):
-        print(f"  already exists: {jsonl} — skipping")
-        return
-
-    records = load_iam(cache_dir="data/hf_cache", split="train")
-    write_jsonl(records, jsonl)
-    generate_split(jsonl, val_ratio=0.05)
-
-
-# ── synthetic Nepali ─────────────────────────────────────────────────────────────
-
-def prepare_synth(
-    font_path: str,
-    n_samples: int = 100_000,
-    img_size: int = 448,
-):
-    """Generate synthetic Nepali document images from the corpus."""
-    print("\n=== Synthetic Nepali documents ===")
-    from src.data.synth_data import generate_dataset
-    from src.data.ocr_dataset import generate_split
-
-    out_dir = "data/documents/nepali_synth"
-    jsonl   = f"{out_dir}/data.jsonl"
-    if os.path.exists(jsonl):
-        print(f"  already exists: {jsonl} — skipping")
-        return
-
-    corpus = "data/corpus/train.jsonl"
-    if not os.path.exists(corpus):
-        print("  ERROR: run --stage corpus first to get Nepali text")
-        return
-
-    # Extract short text snippets from the corpus
-    texts = []
-    with open(corpus, encoding="utf-8") as f:
-        for line in f:
-            article = json.loads(line)["text"]
-            # Split into sentences / short phrases
-            for sent in article.replace("।", "।\n").splitlines():
-                sent = sent.strip()
-                if 10 < len(sent) < 120:
-                    texts.append(sent)
-            if len(texts) >= 50_000:
-                break
-
-    print(f"  {len(texts):,} text snippets extracted from corpus")
-
-    jsonl_out = generate_dataset(
-        out_dir,
-        n_samples=n_samples,
-        texts=texts,
-        font_path=font_path,
-        img_size=img_size,
-        seed=42,
+    ds = load_dataset(
+        "HuggingFaceFW/fineweb-edu", "sample-100BT",
+        split="train", streaming=True,
     )
-    generate_split(jsonl_out, val_ratio=0.05)
+    texts: list[str] = []
+    for sample in ds:
+        if len(texts) >= max_samples:
+            break
+        score = sample.get("score")
+        if score is not None and score < min_quality:
+            continue
+        text = (sample.get("text") or "").strip()
+        if len(text) >= 50:
+            texts.append(text)
+    return texts
 
 
-# ── merge JSONL files for combined training ──────────────────────────────────────
+def _load_wiki(lang: str, max_samples: int) -> list[str]:
+    """Load Wikipedia articles for a language."""
+    from datasets import load_dataset
 
-def merge_ocr_datasets(output: str = "data/documents/train.jsonl"):
+    config = _WIKI_CONFIGS.get(lang)
+    if config is None:
+        return []
+
+    ds = load_dataset(
+        "wikimedia/wikipedia", config, split="train", streaming=True
+    )
+    texts: list[str] = []
+    for sample in ds:
+        if len(texts) >= max_samples:
+            break
+        text = (sample.get("text") or "").strip()
+        if len(text) >= 50:
+            texts.append(text)
+    return texts
+
+
+def _write_jsonl(texts: list[str], path: str):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        for t in texts:
+            f.write(json.dumps({"text": t}, ensure_ascii=False) + "\n")
+
+
+def prepare_corpus(
+    max_samples: int = 200_000,
+    seed: int = 42,
+    val_ratio: float = 0.05,
+    out_dir: str = "data/corpus",
+    quality: int = QUALITY_THRESHOLD,
+):
     """
-    Merge all downloaded OCR JSONL files into one train and one val file.
+    Download a multilingual corpus with SmolLM-style quality filtering.
 
-    Call this after running all individual prepare_* stages.
+    Data mix:
+        - 70% FineWeb-2 Devanagari (ne, hi, mr, sa)
+        - 20% FineWeb-Edu English
+        - 10% Wikipedia (multilingual)
     """
-    print("\n=== Merging OCR datasets ===")
+    rng = random.Random(seed)
+    out = Path(out_dir)
 
-    sources = [
-        ("data/documents/rendered_text_train.jsonl", "data/documents/rendered_text_val.jsonl"),
-        ("data/documents/cord.jsonl",                None),   # already split
-        ("data/documents/iam_train.jsonl",           "data/documents/iam_val.jsonl"),
-        ("data/documents/nepali_synth/data_train.jsonl", "data/documents/nepali_synth/data_val.jsonl"),
-    ]
+    n_fw2 = int(max_samples * 0.70)
+    n_edu = int(max_samples * 0.20)
+    n_wiki = int(max_samples * 0.10)
 
-    train_lines, val_lines = [], []
-    for train_src, val_src in sources:
-        if os.path.exists(train_src):
-            with open(train_src, encoding="utf-8") as f:
-                train_lines += [l for l in f if l.strip()]
-            print(f"  train ← {train_src}")
-        if val_src and os.path.exists(val_src):
-            with open(val_src, encoding="utf-8") as f:
-                val_lines += [l for l in f if l.strip()]
-            print(f"  val   ← {val_src}")
+    all_texts: list[str] = []
 
-    rng = random.Random(42)
-    rng.shuffle(train_lines)
-    rng.shuffle(val_lines)
+    # --- FineWeb-2 Devanagari ---
+    fw2_targets = {
+        "ne (Nepali)": int(n_fw2 * 0.38),
+        "hi (Hindi)": int(n_fw2 * 0.38),
+        "mr (Marathi)": int(n_fw2 * 0.16),
+        "sa (Sanskrit)": int(n_fw2 * 0.08),
+    }
+    for label, target in fw2_targets.items():
+        lang_code = label.split(" ")[0]
+        config = _FINEWEB2_DEVANAGARI.get(lang_code)
+        if config is None or target == 0:
+            continue
+        print(f"  [FineWeb-2 {label}] loading {target:,} docs...")
+        try:
+            texts = _load_fineweb2(config, target)
+            print(f"    → got {len(texts):,} docs")
+            all_texts.extend(texts)
+        except Exception as e:
+            print(f"    [warn] failed to load FineWeb-2 {config}: {e}")
+            continue
 
-    os.makedirs(os.path.dirname(output) or ".", exist_ok=True)
-    val_output = output.replace("train", "val")
+    # --- FineWeb-Edu English ---
+    print(f"  [FineWeb-Edu] loading {n_edu:,} docs (quality>={quality})...")
+    edu_texts = _load_fineweb_edu(n_edu, min_quality=quality)
+    print(f"    → got {len(edu_texts):,} docs")
+    all_texts.extend(edu_texts)
 
-    with open(output,     "w", encoding="utf-8") as f:
-        f.writelines(train_lines)
-    with open(val_output, "w", encoding="utf-8") as f:
-        f.writelines(val_lines)
+    # --- Wikipedia multilingual ---
+    wiki_langs = {"ne": 0.3, "hi": 0.25, "en": 0.25, "mr": 0.1, "sa": 0.1}
+    for lang_code, ratio in wiki_langs.items():
+        target = int(n_wiki * ratio)
+        if target == 0:
+            continue
+        print(f"  [Wikipedia {lang_code}] loading {target:,} docs...")
+        texts = _load_wiki(lang_code, target)
+        print(f"    → got {len(texts):,} docs")
+        all_texts.extend(texts)
 
-    print(f"\n  {len(train_lines):,} train → {output}")
-    print(f"  {len(val_lines):,}  val  → {val_output}")
+    print(f"\n[data] total collected: {len(all_texts):,} docs")
 
+    # Trim to exact max_samples if oversampled
+    if len(all_texts) > max_samples:
+        rng.shuffle(all_texts)
+        all_texts = all_texts[:max_samples]
 
-# ── helpers ──────────────────────────────────────────────────────────────────────
+    rng.shuffle(all_texts)
 
-def _merge_and_split(train_path, val_path, merged_path):
-    lines = []
-    for p in (train_path, val_path):
-        if os.path.exists(p):
-            with open(p, encoding="utf-8") as f:
-                lines += [l for l in f if l.strip()]
-    random.Random(42).shuffle(lines)
-    from src.data.ocr_dataset import generate_split
-    with open(merged_path, "w") as f:
-        f.writelines(lines)
-    generate_split(merged_path, val_ratio=0.05)
+    n_val = max(1, int(len(all_texts) * val_ratio))
+    val_docs = all_texts[:n_val]
+    train_docs = all_texts[n_val:]
 
+    _write_jsonl(train_docs, str(out / "train.jsonl"))
+    _write_jsonl(val_docs, str(out / "val.jsonl"))
+    print(f"[data] done — {len(train_docs)} train / {len(val_docs)} val → {out}/")
 
-# ── CLI ──────────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="Prepare training data for Akshara")
-    parser.add_argument("--stage", choices=["corpus", "rendered", "cord", "iam", "synth", "merge", "all"],
-                        default="all")
-    parser.add_argument("--max_samples", type=int, default=None,
-                        help="Cap number of samples per dataset (default: full dataset)")
-    parser.add_argument("--font_path", type=str, default=None,
-                        help="Path to NotoSansDevanagari-Regular.ttf (required for --stage synth)")
-    parser.add_argument("--n_synth", type=int, default=100_000,
-                        help="Number of synthetic Nepali samples to generate")
-    parser.add_argument("--img_size", type=int, default=448)
+    parser = argparse.ArgumentParser(
+        description="Akshara data preparation (SmolLM-style)"
+    )
+    parser.add_argument(
+        "--max_samples", type=int, default=1_000_000,
+        help="Total target document count (default: 1M)",
+    )
+    parser.add_argument(
+        "--out_dir", type=str, default="data/corpus",
+        help="Output directory for the corpus JSONL files",
+    )
+    parser.add_argument(
+        "--quality", type=int, default=QUALITY_THRESHOLD,
+        help="Minimum EduScore quality threshold 0-5 (default: 3)",
+    )
+    parser.add_argument(
+        "--seed", type=int, default=42,
+        help="Random seed for train/val split",
+    )
     args = parser.parse_args()
 
-    stages = (
-        ["corpus", "rendered", "cord", "iam"]
-        if args.stage == "all"
-        else [args.stage]
+    prepare_corpus(
+        max_samples=args.max_samples,
+        seed=args.seed,
+        out_dir=args.out_dir,
+        quality=args.quality,
     )
-
-    for stage in stages:
-        if stage == "corpus":
-            prepare_corpus(max_samples=args.max_samples or 200_000)
-        elif stage == "rendered":
-            prepare_rendered(max_samples=args.max_samples or 100_000)
-        elif stage == "cord":
-            prepare_cord()
-        elif stage == "iam":
-            prepare_iam()
-        elif stage == "synth":
-            if not args.font_path:
-                print("ERROR: --font_path required for synth stage")
-                print("  brew install font-noto-sans-devanagari")
-                print("  then: python scripts/prepare_data.py --stage synth --font_path /path/to/NotoSansDevanagari-Regular.ttf")
-                return
-            prepare_synth(args.font_path, n_samples=args.n_synth, img_size=args.img_size)
-        elif stage == "merge":
-            merge_ocr_datasets()
-
-    if args.stage in ("all", "merge"):
-        merge_ocr_datasets()
-
-    print("\nDone. Next steps:")
-    print("  1. python scripts/pretrain.py --config configs/pretrain.json")
-    print("  2. python scripts/train_ocr.py --config configs/ocr_finetune.json \\")
-    print("         --pretrain_ckpt checkpoints/pretrain.pt")
 
 
 if __name__ == "__main__":

@@ -66,6 +66,21 @@ wget -q 'https://github.com/googlefonts/noto-fonts/raw/main/hinted/ttf/NotoSansD
      -O fonts/NotoSansDevanagari-Regular.ttf
 ```
 
+**⚠️ libraqm — required before generating synthetic data.** PIL needs libraqm to correctly position Devanagari matras and conjuncts. Without it, every training label is silently corrupt.
+
+```bash
+# macOS
+brew install harfbuzz fribidi
+pip install pillow --no-binary :all:
+
+# Linux
+sudo apt install libraqm-dev
+pip install pillow --no-binary :all:
+
+# Verify
+python -c "from PIL import features; print(features.check('raqm'))"   # → True
+```
+
 ---
 
 ## Data Preparation

@@ -11,9 +11,9 @@ WHY pretrain before OCR fine-tuning:
 
 TRAINING RECIPE:
     - Cosine LR schedule with linear warmup (standard for transformers).
-    - Gradient accumulation to simulate a larger effective batch on T4 16GB.
-    - bf16 AMP (autocast) to halve VRAM for activations.
-    - Gradient checkpointing to trade compute for memory on the HybridDecoder.
+    - Gradient accumulation to simulate a larger effective batch on T4 15GB.
+    - fp32 (T4 sm_75 doesn't support bf16 natively; fp16 would need GradScaler).
+    - FLA (Flash Linear Attention) kernels for GDN speed (~2,000 tok/s).
     - Periodic eval (perplexity) and checkpoint saving.
 
 CHECKPOINT FORMAT:
@@ -123,7 +123,7 @@ def estimate_loss(
 
 
 def save_checkpoint(path: str, model: nn.Module, optimizer, step: int, cfg: PretrainConfig) -> None:
-    """Save a portable checkpoint dict to ``path``."""
+    """Save a portable checkpoint dict to ``path``, then optionally push to HF Hub."""
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     torch.save({
         "step": step,
@@ -131,6 +131,30 @@ def save_checkpoint(path: str, model: nn.Module, optimizer, step: int, cfg: Pret
         "optimizer_state_dict": optimizer.state_dict(),
         "config": vars(cfg),
     }, path)
+    _push_to_hub(path, cfg, step)
+
+
+def _push_to_hub(path: str, cfg: PretrainConfig, step: int) -> None:
+    """Upload the checkpoint to HF Hub if cfg.hf_repo is set. Never raises —
+    a failed upload logs a warning and training continues (the local copy
+    still exists, and the next save retries)."""
+    repo = getattr(cfg, "hf_repo", None)
+    if not repo:
+        return
+    try:
+        from huggingface_hub import HfApi
+        api = HfApi()
+        api.create_repo(repo, repo_type="model", exist_ok=True, private=True)
+        api.upload_file(
+            path_or_fileobj=path,
+            path_in_repo=os.path.basename(path),
+            repo_id=repo,
+            repo_type="model",
+            commit_message=f"checkpoint step {step}",
+        )
+        print(f"  [hub] pushed {os.path.basename(path)} → {repo} (step {step})")
+    except Exception as e:
+        print(f"  [hub] upload failed (training continues, local copy kept): {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -153,6 +177,8 @@ def main() -> None:
     parser.add_argument("--lr",          type=float, default=None)
     parser.add_argument("--min_lr",      type=float, default=None)
     parser.add_argument("--out_ckpt",    type=str,   default=None)
+    parser.add_argument("--hf_repo",     type=str,   default=None,
+                        help="HF Hub repo (e.g. user/akshara-pretrain) to back up checkpoints to")
     parser.add_argument("--seed",        type=int,   default=None)
     parser.add_argument("--device",      type=str,   default=None)
     args = parser.parse_args()
@@ -186,10 +212,17 @@ def main() -> None:
         n_layers=cfg.n_layers,
         max_seq_len=cfg.max_seq_len,
         attn_every=cfg.attn_every,
+        use_fla=cfg.use_fla,
     )
     if cfg.use_gradient_checkpointing:
         model.set_gradient_checkpointing(True)
     model = model.to(device)
+
+    if cfg.compile:
+        torch.set_float32_matmul_precision("high")
+        print("[pretrain] compiling model with torch.compile...")
+        model = torch.compile(model)
+        print("[pretrain] compilation done")
 
     n_params = sum(p.numel() for p in model.parameters())
     print(f"[pretrain] model params: {n_params:,} (~{n_params / 1e6:.1f}M)")

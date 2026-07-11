@@ -246,6 +246,7 @@ def main() -> None:
         vit_layers=cfg.vit_layers,
         vit_heads=cfg.vit_heads,
         vit_pretrained=cfg.vit_pretrained,
+        use_fla=cfg.use_fla,
     )
     if cfg.use_gradient_checkpointing:
         model.set_gradient_checkpointing(True)
