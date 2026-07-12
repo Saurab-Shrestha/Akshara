@@ -12,9 +12,9 @@ THREE CONFIG LEVELS:
     PretrainConfig       -- language-only pretraining (text tokens, no images).
     OCRFinetuneConfig    -- vision-language OCR fine-tuning on image+text pairs.
 
-HARDWARE TARGET: Kaggle T4 (16 GB VRAM).
-    The defaults are tuned to fit comfortably with bf16 AMP + gradient checkpointing.
-    effective_batch = batch_size * grad_accum = 64 tokens for both stages.
+HARDWARE: Stage 1 trained on a Lightning.ai A100 (bf16, FLA kernel). Effective
+    batch = batch_size * grad_accum; hold it fixed across resumes so the LR
+    schedule stays consistent (raise batch_size / lower grad_accum for speed).
 """
 
 from __future__ import annotations
@@ -40,9 +40,9 @@ class ModelConfig:
         - n_layers=16, attn_every=4  → 12 GDN blocks + 4 attention blocks (3:1 ratio)
         - max_seq_len=512  (fits a full A4 page of dense Nepali text)
 
-    VISION ENCODER (ViT-S/16, ~21.6M params):
-        - img_size=224, patch_size=16 → 14×14=196 patch tokens
-        - vision_dim=384, vit_layers=12, vit_heads=6
+    VISION ENCODER (DINOv2-S/14, pretrained, ~22M params):
+        - img_size=448, patch_size=14 → 32×32=1024 patch tokens
+        - vision_dim=384 (dinov2-small hidden size)
 
     CONNECTOR (2-layer MLP, ~0.9M params):
         - projects vision_dim (384) → n_embed (768)

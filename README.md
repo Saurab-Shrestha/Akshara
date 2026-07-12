@@ -1,10 +1,14 @@
 # Akshara (अक्षर)
 
-**अक्षर** — Sanskrit for *letter* and *imperishable*. Nepali/Devanagari document OCR: page image in, structured `<p>`, `<h1>`, `<table>` HTML out.
+**अक्षर** — Sanskrit for *letter* and *imperishable*. Devanagari + English document OCR: page image in, structured `<p>`, `<h1>`, `<table>` HTML out.
 
-Pretrained layout/table-structure models (Surya) find the *structure*; a custom-trained crop recognizer does the *reading*. Structure is geometry and language-agnostic — reading Devanagari is the only part that needs training, so it's the only part we train.
+Pretrained layout/table-structure models (Surya) find the *structure*; a custom-trained crop recognizer does the *reading*. Structure is geometry and language-agnostic — reading the glyphs is the only part that needs training, so it's the only part we train.
 
-**Full design doc: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** (flowcharts, rationale, data formats).
+> **This is a learning project** — the goal is to understand how OCR systems are built end-to-end, not to out-compete existing models (PaddleOCR-VL, Nemotron-OCR). We build the recognizer ourselves and use those models/datasets as baselines and teachers.
+
+> **Status:** Stage 1 (language pretrain) ✅ **done** — decoder prior on HF at [`Saurab0/akshara-pretrain`](https://huggingface.co/Saurab0/akshara-pretrain) (~540M tokens, dev ppl ≈ 6.7; strong Nepali, functional English). Next: Stage 2 (crop recognizer).
+
+**Full design doc: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** · **OCR plan: [docs/OCR_FINETUNE_PLAN.md](docs/OCR_FINETUNE_PLAN.md)**
 
 ---
 
@@ -21,16 +25,16 @@ Surya layout + table structure (pretrained)   — paragraphs, headings, table ce
 Akshara recognizer (trained by us):
     DINOv2-S/14 encoder    — pretrained, 1024 patches
     Connector (MLP+norm)   — 384 → 768
-    Hybrid decoder         — 12 layers, GDN:attention 3:1, GQA, RoPE
+    Hybrid decoder         — 16 layers, GDN:attention 3:1, GQA, RoPE
     │
-    ▼  plain Nepali text per crop
+    ▼  plain text per crop (Devanagari / Latin)
     │
 HTML assembler (plain Python)                 — region class → <p>/<h1>/<table>
 ```
 
-The decoder alternates Gated DeltaNet (GDN) recurrence layers with full-attention "exact recall" layers at a 3:1 ratio.
+The decoder alternates Gated DeltaNet (GDN) recurrence layers with full-attention "exact recall" layers at a 3:1 ratio. On GPU the GDN runs via the FLA Triton kernel; a pure-Python fallback exists for CPU/Mac.
 
-**Recognizer size**: ~296M parameters (190M is the 248k-vocab embedding table)
+**Recognizer size**: ~308M parameters (190M is the 248k-vocab embedding table)
 
 ---
 
@@ -38,12 +42,12 @@ The decoder alternates Gated DeltaNet (GDN) recurrence layers with full-attentio
 
 Curriculum: learn the language, learn to read a line, learn to read a paragraph (the line→paragraph warmup follows [Pix2Struct](https://arxiv.org/abs/2210.03347)'s reading-curriculum result):
 
-| Stage | What trains | Data | Goal |
-|---|---|---|---|
-| 1 — Language pretrain | Decoder only | Nepali Wikipedia / CulturaX | Learn Devanagari token patterns |
-| 2A — Line warmup | Full model | Synthetic single-line crops | Glyph-level reading (conjuncts, matras) |
-| 2B — Paragraph OCR | Full model | Synthetic multi-line crops | Multi-line reading |
-| 3 — Nepali fine-tune | Full model | Synthetic Nepali pages | Adapt to Devanagari documents |
+| Stage | What trains | Data | Goal | Status |
+|---|---|---|---|---|
+| 1 — Language pretrain | Decoder only | 965k-doc mix: 70% FineWeb-2 Devanagari (ne/hi/mr/sa) + 20% FineWeb-Edu English + 10% Wikipedia | Learn script + grammar prior | ✅ done (ppl ≈ 6.7) |
+| 2A — Line warmup | Full model | Real lines (ocr-mlt-50m, Mozhi-LR) + small synthetic | Glyph-level reading (conjuncts, matras) | next |
+| 2B — Paragraph OCR | Full model | Multi-line crops | Multi-line reading | |
+| 3 — Real fine-tune | Full model | Real corrected crops | Domain adaptation (gate on heiDATA) | |
 
 ---
 
@@ -56,6 +60,13 @@ cd Akshara
 python -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
+```
+
+**For GPU training**, also install the FLA kernel and log into HF (checkpoint backup). On an ephemeral cloud box (Lightning/Kaggle) the conda env resets each session — reinstall FLA every time:
+
+```bash
+pip install flash-linear-attention==0.5.1   # GDN Triton kernel (CUDA only)
+huggingface-cli login                        # write-scoped token → checkpoint backup
 ```
 
 Download the Noto Devanagari font (required for synthetic data generation):
@@ -85,61 +96,60 @@ python -c "from PIL import features; print(features.check('raqm'))"   # → True
 
 ## Data Preparation
 
+**Stage 1 corpus** (multilingual mix, ~965k docs):
+
 ```bash
-# Nepali Wikipedia corpus (Stage 1 language pretrain)
-PYTHONPATH=. python scripts/prepare_data.py --stage corpus --max_samples 200000
-
-# Stage 2A: synthetic single-line crops (rendered from the corpus)
-PYTHONPATH=. python src/data/synth_data.py \
-    --corpus data/corpus/train.jsonl --fonts fonts/ \
-    --out data/crops/lines --n 200000 --max_lines 1
-
-# Stage 2B: synthetic paragraph crops
-PYTHONPATH=. python src/data/synth_data.py \
-    --corpus data/corpus/train.jsonl --fonts fonts/ \
-    --out data/crops/paras --n 100000 --max_lines 12
+PYTHONPATH=. python scripts/prepare_data.py --max_samples 1000000 --out_dir data/corpus_v4
 ```
 
-External datasets worth mixing in (see docs/ARCHITECTURE.md §4):
+**Stage 2 data — real-first (see [docs/OCR_FINETUNE_PLAN.md](docs/OCR_FINETUNE_PLAN.md)).**
+Real labeled data now carries the bulk; synthetic is a small supplement, so the
+font/libraqm work only has to hold at small scale.
 
 | Dataset | Use |
 |---|---|
-| [interfaze-ai/ocr-mlt-50m](https://huggingface.co/datasets/interfaze-ai/ocr-mlt-50m) | filter `ne`/`hi` → bulk Stage 2A data (Apache 2.0) |
-| [Mozhi / IIIT printed lines](https://cvit.iiit.ac.in/usodi/tdocrmil.php) | real printed Hindi lines — Stage 2A supplement |
+| [interfaze-ai/ocr-mlt-50m](https://huggingface.co/datasets/interfaze-ai/ocr-mlt-50m) | filter `ne`/`hi`/`en` → **primary bulk** Stage 2A (Apache 2.0, on HF) |
+| [Mozhi-LR (CVIT/IIIT)](https://cvit.iiit.ac.in/images/ConferencePapers/2024/Printed-OCR-for-Extremely-Low-resource-Indic-Languages.pdf) | real **printed Nepali** words — Stage 2A/3 |
+| [oscar-corpus/mOSCAR](https://huggingface.co/datasets/oscar-corpus/mOSCAR) | image source to pseudo-label with a teacher model (not OCR-aligned itself) |
 | [heiDATA printed Devanagari](https://heidata.uni-heidelberg.de/dataset.xhtml?persistentId=doi:10.11588/data/EGOKEI) | 5,139 real lines — held-out **eval only** |
+
+Small synthetic supplement (understand the technique / paragraph layouts):
+
+```bash
+PYTHONPATH=. python src/data/synth_data.py \
+    --corpus data/corpus_v4/train.jsonl --fonts fonts/ \
+    --out data/crops/lines --n 20000 --max_lines 1
+```
 
 ---
 
 ## Training
 
-**Stage 1 — Language pretraining** (~8h on T4, ~12h on M4)
+**Stage 1 — Language pretraining** ✅ *done* (~9h on an A100). Checkpoint on HF at `Saurab0/akshara-pretrain`. To reproduce / resume:
 
 ```bash
-PYTHONPATH=. python scripts/pretrain.py \
-    --config configs/pretrain.json \
-    --device cuda   # or mps for Apple Silicon
+PYTHONPATH=. PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+python scripts/pretrain.py \
+    --config configs/a100_pretrain.json \
+    --hf_repo Saurab0/akshara-pretrain   # backs up every checkpoint to HF
+# resume:  --resume checkpoints/pretrain_a100_v4.pt
 ```
 
-**Stage 2 — OCR fine-tune on English documents** (~4h on T4)
+**Stage 2 — OCR fine-tune** (crop recognizer; see [OCR plan](docs/OCR_FINETUNE_PLAN.md)):
 
 ```bash
 PYTHONPATH=. python scripts/train_ocr.py \
     --config configs/ocr_finetune.json \
-    --pretrain_ckpt checkpoints/pretrain.pt \
+    --pretrain_ckpt checkpoints/pretrain_a100_v4.pt \
+    --train_path data/crops/lines/data.jsonl \
+    --hf_repo Saurab0/akshara-ocr \
     --device cuda
 ```
 
-**Stage 3 — Nepali fine-tune** (~2h on T4)
+**Verify Stage 1 language quality:**
 
 ```bash
-PYTHONPATH=. python scripts/train_ocr.py \
-    --config configs/ocr_finetune.json \
-    --pretrain_ckpt checkpoints/ocr.pt \
-    --train_path data/documents/nepali_synth/data_train.jsonl \
-    --dev_path   data/documents/nepali_synth/data_val.jsonl \
-    --lr 3e-5 --train_steps 10000 \
-    --out_ckpt checkpoints/ocr_nepali.pt \
-    --device cuda
+PYTHONPATH=. python scripts/lm_eval.py --ckpt checkpoints/pretrain_a100_v4.pt --device cuda
 ```
 
 **Smoke test** (runs in ~2 minutes on CPU, verifies the full pipeline):
@@ -151,6 +161,8 @@ PYTHONPATH=. python scripts/train_ocr.py --config configs/smoke/ocr_finetune.jso
 ---
 
 ## Inference
+
+> **Note:** the trained model uses the FLA GDN kernel, which is **CUDA-only** — inference currently needs a GPU box. CPU/Mac inference (and off-GPU Surya) will need an FLA-GDN → pure-Python-GDN weight converter (planned for the inference stage).
 
 ```bash
 PYTHONPATH=. python scripts/generate.py \
@@ -168,19 +180,24 @@ Output is structured HTML:
 
 ---
 
-## Kaggle Training
+## Cloud training (Lightning.ai)
 
-The full pipeline is set up to run as a Kaggle script kernel (T4 GPU):
+Stage 1 was trained on a Lightning.ai A100. Cloud boxes are **ephemeral** — the
+disk and installed packages do **not** survive a session ending. The playbook
+that keeps a run safe (learned after losing a 9h run):
+
+- **Back up every checkpoint to HF** (`--hf_repo Saurab0/akshara-pretrain`). The
+  namespace is **case-sensitive** and the token must be **write**-scoped.
+- **Reinstall `flash-linear-attention==0.5.1`** on each new machine (the GDN
+  weights won't load without it).
+- **Regenerate the corpus on-box** before each run (it isn't persisted).
+- On a free-tier allowance, **measure tok/s early and trim `train_steps`** so the
+  cosine schedule lands cleanly inside the budget instead of getting killed.
+
+Pull the trained model anywhere:
 
 ```bash
-# Push to Kaggle (one command — runs data prep + all 3 training stages)
-kaggle kernels push -p .
-
-# Check progress
-open https://www.kaggle.com/code/saurabstha5/akshara
-
-# Download checkpoints when done
-kaggle kernels output saurabstha5/akshara -p ./checkpoints
+huggingface-cli download Saurab0/akshara-pretrain pretrain_a100_v4.pt --local-dir checkpoints
 ```
 
 ---

@@ -5,6 +5,16 @@ prior lives at `Saurab0/akshara-pretrain` on HF (step 5400, ~540M tokens, dev
 ppl ≈ 6.7; strong Nepali, functional English — see the language-eval results).
 This document covers turning that language prior into a crop **recognizer**.
 
+**Two framing decisions that shape this plan:**
+- **Learning-first.** The goal is to understand how OCR systems are built, not
+  to beat PaddleOCR-VL / Nemotron-OCR. So we build the recognizer ourselves, and
+  use those models as *baselines* (a reference CER to measure against) and
+  optional *teachers* (pseudo-labeling), never as replacements.
+- **Real-data-first.** Enough real labeled data now exists (ocr-mlt-50m, Mozhi-LR)
+  that it carries the bulk of training. Synthetic drops to a *small supplement*
+  (paragraph layouts + a run to understand the technique), which means the
+  font/libraqm work only has to hold at small scale — not as a 300k-crop factory.
+
 ---
 
 ## 1. What we're building
@@ -60,37 +70,39 @@ every N steps; final gate is the **real** held-out set (heiDATA, never trained).
 
 ## 3. Data preparation (the real work of this phase)
 
-### 3.1 Synthetic crops (primary Stage 2 data)
-`src/data/synth_data.py` renders (crop image, text) pairs from the Stage-1
-corpus. Run twice:
-
-```bash
-# 2A — single-line crops
-PYTHONPATH=. python src/data/synth_data.py \
-    --corpus data/corpus_v4/train.jsonl --fonts fonts/ \
-    --out data/crops/lines --n 300000 --max_lines 1
-
-# 2B — paragraph crops
-PYTHONPATH=. python src/data/synth_data.py \
-    --corpus data/corpus_v4/train.jsonl --fonts fonts/ \
-    --out data/crops/paras --n 150000 --max_lines 12
-```
-
-**BLOCKER to resolve first — fonts.** Mixed-script crops need fonts that cover
-BOTH Devanagari and Latin (or per-script font fallback), else English/numbers
-render as tofu boxes and corrupt labels. Before generating at scale:
-- Collect 3–5 fonts with good coverage (Noto Sans Devanagari + a Latin Noto, or
-  fonts covering both), and confirm the generator's per-font coverage check
-  picks the right font per script run.
-- **libraqm is mandatory** (correct matra/conjunct shaping) — Kaggle/Linux
-  wheels include it; verify `features.check("raqm") == True` on the box.
-
-### 3.2 External real/large data (mix in, don't rely solely on synthetic)
+### 3.1 Real data (primary Stage 2 source)
 | Dataset | Use | Note |
 |---|---|---|
-| interfaze-ai/ocr-mlt-50m | bulk 2A lines | filter `lang ∈ {ne, hi, en}` → our JSONL |
-| Mozhi / IIIT printed lines | 2A supplement | real printed Hindi lines |
+| interfaze-ai/ocr-mlt-50m | **bulk 2A lines** | on HF; filter `lang ∈ {ne,hi,en}` → our JSONL. Start here. |
+| Mozhi-LR (CVIT/IIIT) | real Nepali 2A/3 | request form; real printed word images |
+| oscar-corpus/mOSCAR | teacher-pseudo-labeled pairs | image source only (not OCR-aligned) — see 3.3 |
 | heiDATA printed Devanagari | **eval only** | 5,139 real lines — NEVER train on it |
+
+First move: write the ocr-mlt-50m → JSONL converter (filter ne/hi/en) and
+eyeball a sample. This is the low-friction bulk of Stage 2A.
+
+### 3.2 Synthetic supplement (small — to understand the technique + paragraph gap)
+`src/data/synth_data.py` renders (crop, text) pairs from the Stage-1 corpus.
+Kept **small** now that real data carries the bulk:
+
+```bash
+PYTHONPATH=. python src/data/synth_data.py \
+    --corpus data/corpus_v4/train.jsonl --fonts fonts/ \
+    --out data/crops/lines --n 20000 --max_lines 1
+```
+
+- **Font open-item (small scale now):** mixed-script crops need fonts covering
+  BOTH Devanagari and Latin (or per-script fallback), else English/numbers
+  render as tofu and corrupt labels. Only has to hold for the small supplement.
+- **libraqm is mandatory** (correct matra/conjunct shaping) — verify
+  `features.check("raqm") == True` on the box.
+
+### 3.3 Baseline + teacher (existing models)
+Run **PaddleOCR-VL** (or Nemotron-OCR) on the eval crops for a reference CER —
+this tells us whether our own recognizer is working, and whether the model is
+good enough at Nepali to **pseudo-label mOSCAR** images into real training
+pairs (`mOSCAR image → Surya crop → teacher transcription`). If the teacher is
+weak on Nepali, skip the mOSCAR path and lean on ocr-mlt-50m + Mozhi.
 
 ### 3.3 Format
 `CropOCRDataset` expects JSONL `{"image": "path.png", "text": "..."}` (dir mode
@@ -144,8 +156,9 @@ PYTHONPATH=. python scripts/train_ocr.py \
 
 ## 5. Open items / risks
 
-1. **Font coverage (blocker)** — must fix bilingual rendering before mass crop
-   generation, or every mixed-script label is corrupt.
+1. **Font coverage (small-scale open item, no longer a blocker)** — mixed-script
+   synthetic crops need bilingual fonts, else labels corrupt. Only matters for
+   the small synthetic supplement now that real data carries the bulk.
 2. **English is the weak side of the prior** — if English-doc OCR lags, add
    English to Stage 3 (data-driven, not preemptive).
 3. **FLA → portable inference** — the trained model needs FLA (CUDA) to run.
@@ -161,11 +174,14 @@ PYTHONPATH=. python scripts/train_ocr.py \
 
 ## 6. Order of work
 
-1. Fix fonts + verify bilingual rendering (small, unblocks everything).
-2. Build the ocr-mlt-50m → JSONL converter (filter ne/hi/en); download Mozhi +
-   heiDATA (eval).
-3. Generate 2A line crops (synthetic) + mix in external lines.
-4. Stage 2A run (line warmup) → check CER on synthetic eval.
-5. Generate 2B paragraph crops → Stage 2B run.
-6. Stage 3 on real data → gate on **heiDATA** CER.
-7. Wire Surya pipeline; end-to-end page → HTML.
+1. **ocr-mlt-50m → JSONL converter** (filter ne/hi/en) + eyeball a sample —
+   real training data flowing, unblocks Stage 2A. Start here.
+2. **PaddleOCR-VL baseline** CER on eval crops — reference number, and decides
+   whether the mOSCAR pseudo-label path is open.
+3. Request **Mozhi-LR**; download **heiDATA** (held-out eval).
+4. **Stage 2A run** on real lines → compare CER to the baseline.
+5. **Small synthetic supplement** (fonts only at small scale) + paragraph crops
+   → **Stage 2B run**.
+6. **Stage 3** on real corrected data → gate on **heiDATA** CER.
+7. *(optional)* mOSCAR pseudo-labeling if the teacher proved good at Nepali.
+8. Wire the **Surya pipeline**; end-to-end page → HTML.

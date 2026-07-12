@@ -1,5 +1,11 @@
 # 08 · Vision Encoder (ViT-S/16)
 
+> **⚠️ Partly superseded.** `src/models/vit.py` now wraps **pretrained
+> DINOv2-S/14 at 448px** (14×14 patches → 1024 tokens, dim 384), not a
+> from-scratch ViT-S/16 at 224px/16px. The *concepts* below (patch embedding,
+> the vision→language bridge) still apply; the specific arch/params don't. See
+> **[ARCHITECTURE.md §2.2](ARCHITECTURE.md)** for the current encoder.
+
 Converting a document image into a sequence of patch tokens.
 
 **File:** [`src/models/vit.py`](../src/models/vit.py)

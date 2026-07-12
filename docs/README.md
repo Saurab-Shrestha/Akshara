@@ -1,39 +1,48 @@
-# Nepali OCR VLM — Documentation
+# Akshara — Component Walkthroughs (learning notes)
 
-A step-by-step guide to building a Surya v2-style Vision Language Model for
-Nepali (Devanagari) + English OCR from scratch, designed to run on Kaggle free GPUs.
+A step-by-step, build-from-scratch tutorial for the model's components.
+
+> **⚠️ This tutorial series predates two big changes.** The canonical, current
+> design is **[ARCHITECTURE.md](ARCHITECTURE.md)** (+ **[OCR_FINETUNE_PLAN.md](OCR_FINETUNE_PLAN.md)**) — read those first.
+> Two shifts happened after these notes were written:
+> 1. **Vision encoder** is now **pretrained DINOv2-S/14 at 448px** (1024 patches), not a from-scratch ViT-S/16.
+> 2. **Full-page OCR → crop recognition**: Surya finds structure, we only read crops. So `11_detection.md` is **superseded**.
+>
+> The component notes 03–07, 09, 10 are still accurate; 08 (vision) and 11 (detection) are stale.
 
 ---
 
 ## What we're building
 
-A **~270M parameter hybrid VLM** that reads Nepali and English document images
-and outputs the text as Unicode. The architecture mirrors Surya v2:
+A **~308M parameter hybrid VLM** that reads Devanagari + English document
+*crops* and outputs Unicode text:
 
 ```
-Document Image
+Crop image (448×448)
       │
       ▼
  ┌─────────────────────┐
- │  Vision Encoder     │  ViT-S/16 — splits image into 16×16 patches,
- │  (~22M params)      │  encodes each patch into a 768-dim vector
+ │  Vision Encoder     │  DINOv2-S/14 (pretrained) — 14×14 patches at 448px
+ │  (~22M params)      │  → 32×32 = 1024 tokens, dim 384
  └──────────┬──────────┘
-            │ patch tokens (N × 768)
+            │ patch tokens (1024 × 384)
             ▼
  ┌─────────────────────┐
- │  Connector          │  2-layer MLP — bridges encoder and decoder
- │  (~5M params)       │  dimensions
+ │  Connector          │  2-layer MLP + RMSNorm — 384 → 768
+ │  (~0.9M params)     │
  └──────────┬──────────┘
             │ visual prefix
             ▼
  ┌─────────────────────┐
- │  Hybrid Decoder     │  3:1 GDN + Attention — reads visual tokens,
- │  (~270M params)     │  generates Nepali/English text autoregressively
+ │  Hybrid Decoder     │  16 layers, 3:1 GDN + Attention (FLA on GPU),
+ │  (~308M params)     │  generates Devanagari/Latin text autoregressively
  └──────────┬──────────┘
             │
             ▼
     "नेपाल राम्रो देश हो"
 ```
+
+**Status:** Stage 1 language pretrain ✅ done — prior on HF (`Saurab0/akshara-pretrain`).
 
 ---
 
@@ -79,9 +88,10 @@ documents), 25% are exact attention (ensures verbatim character recall for OCR).
 | [08 · Vision Encoder](08_vision_encoder.md) | ViT-S/16 patch encoding | `src/models/vit.py` |
 | [09 · Connector](09_connector.md) | Vision→language bridge | `src/models/connector.py` |
 | [10 · Full VLM](10_vlm.md) | Assembled end-to-end model | `src/models/vlm.py` |
-| 11 · Synthetic Data *(coming)* | SynthTIGER Nepali text rendering | `src/data/` |
-| 12 · Training *(coming)* | Pretraining + OCR fine-tuning on Kaggle | `scripts/` |
-| 13 · Inference *(coming)* | Running OCR on a real Nepali document | `scripts/generate.py` |
+| ~~11 · Detection~~ | **superseded** — full-page detection was replaced by Surya + crop recognition (see [ARCHITECTURE.md](ARCHITECTURE.md)) | — |
+
+Current design, curriculum, data strategy, and training/infra all live in
+**[ARCHITECTURE.md](ARCHITECTURE.md)** and **[OCR_FINETUNE_PLAN.md](OCR_FINETUNE_PLAN.md)**.
 
 ---
 
@@ -137,11 +147,9 @@ nepali-ocr-vlm/
 
 ---
 
-## Hardware target
+## Hardware
 
-Designed to train on **Kaggle free tier** (T4 GPU, 16GB VRAM, 30h/week):
-- Enable gradient checkpointing: `model.set_gradient_checkpointing(True)`
-- Use gradient accumulation to simulate larger batches
-- The GDN layers reduce memory at inference vs pure attention
-
-For production training: 4× A100 80GB, ~$10–15k cloud cost for the full pipeline.
+Stage 1 trained on a **Lightning.ai A100** (bf16 + FLA kernel, ~20k tok/s). See
+[ARCHITECTURE.md §6](ARCHITECTURE.md) for the ephemeral-machine playbook (HF
+backup, FLA reinstall, corpus regen, allowance-fit) — the practical details that
+actually keep a cloud run from being lost.

@@ -1,5 +1,14 @@
 # Stage 11 — Text Detection & Full Document Pipeline
 
+> **⚠️ SUPERSEDED.** This describes an earlier design where our VLM read a full
+> page and needed a from-scratch line detector. We pivoted to **crop
+> recognition**: pretrained **Surya** finds layout/table structure and emits
+> region crops; our recognizer only reads one crop at a time. There is no
+> custom detector, and `src/detection/` was removed. This page is kept for
+> historical context only — see **[ARCHITECTURE.md](ARCHITECTURE.md)** for the
+> current pipeline. (Also note: geometry below assumes 224px/16px patches; the
+> encoder is now DINOv2-S/14 at 448px.)
+
 ## Why detection matters
 
 Our VLM is trained to read **one line at a time**.  Give it a full newspaper
