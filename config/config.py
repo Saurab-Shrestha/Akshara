@@ -140,7 +140,7 @@ class PretrainConfig(ModelConfig):
     # Durable backup: if set (e.g. "username/akshara-pretrain"), every saved
     # checkpoint is also uploaded to this HF Hub repo. Survives the training
     # machine dying. Requires `huggingface-cli login` on the box first.
-    hf_repo: Optional[str] = None
+    hf_repo: Optional[str] = "Saurab0/akshara-pretrain"  # case-sensitive namespace!
 
 
 # ---------------------------------------------------------------------------

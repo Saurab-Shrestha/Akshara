@@ -19,5 +19,5 @@
   "dev_path": "data/corpus_v4/val.jsonl",
   "out_ckpt": "checkpoints/pretrain_a100_v4.pt",
   "log_dir": "logs/pretrain_a100_v4",
-  "hf_repo": "REPLACE_WITH_HF_USERNAME/akshara-pretrain"
+  "hf_repo": "Saurab0/akshara-pretrain"
 }
