@@ -201,3 +201,29 @@ interpolation, variable resolution, the connector). Upgrade path if the
 vision side becomes the bottleneck: DINOv2-B/14 (86M) or SigLIP-B/16 (93M,
 text-aligned) — a config + connector-width change. A from-scratch tiny ViT is
 a good side experiment, not the main path.
+
+---
+
+## 6. Audio (decided 2026-11-12)
+
+**Speech output: separate TTS model.** Akshara always outputs text, and a
+separate pretrained TTS model reads that text aloud. The decoder never
+generates audio, so there are no codec tokens, no vocabulary growth and no
+audio-generation training. Any Nepali/Hindi/English TTS can be plugged in
+behind `generate.py` / `src/pipeline.py` without touching the model.
+
+**Speech input: later, same pattern as vision (not scheduled).**
+```
+audio ──► Whisper-small encoder (pretrained, ~88M) ──► connector (4× downsample)
+      ──► replaces <|audio|> ──► decoder ──► text
+```
+- `<|audio|>` takes one of the 10 reserved special tokens, so there's no embedding resize.
+- 30 s of audio → 1500 Whisper frames → ~375 tokens after downsampling, which fits the 4096-position RoPE tables.
+- Stages: align on ASR pairs (audio → transcript), then instruction-tune
+  (spoken questions, speech translation).
+- Nepali data: OpenSLR 54, Common Voice `ne`, FLEURS `ne_np`.
+
+**Why not native speech output:** it needs thousands of codec tokens (EnCodec/Mimi/SNAC)
+in the vocabulary, much heavier training, and Nepali TTS data is scarce. If
+it's ever wanted, grow the embedding after pretraining and train the new
+rows in a dedicated audio stage.
