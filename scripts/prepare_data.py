@@ -197,7 +197,8 @@ def train_only(license: str | None) -> bool:
     lic = license.upper()
     # "other" / "per-subsource" = aggregates whose parts carry their own licenses
     return any(k in lic for k in ("NC", "NON-COMMERCIAL", "REDISTRIBUTABLE=FALSE", "UNCLEAR",
-                                  "NONE STATED", "OTHER", "PER-SUBSOURCE"))
+                                  "NONE STATED", "OTHER", "PER-SUBSOURCE", "RESERVED",
+                                  "NO PART", "PERMISSION", "UNKNOWN"))
 
 
 def _row(text: str, lang: str, train_only: bool = False) -> str:
@@ -318,6 +319,7 @@ if __name__ == "__main__":
         assert not train_only("CC BY-SA 4.0") and not train_only("CC0") and not train_only("CC BY 2.0 FR")
         assert train_only("other (per-subsource licenses)") and train_only("odc-by (per-subsource licenses)")
         assert not train_only("odc-by") and not train_only("cc0-1.0 (CC ToU)")
+        assert train_only("All rights reserved") and train_only("no part may be reproduced")
         assert lang_repeats({"mai": 400e6, "sat": 130e6, "awa": 65e6, "lif": 3e6}) == {"mai": 1, "sat": 2, "awa": 3, "lif": 4}
         print("prepare_data selftest passed")
     else:

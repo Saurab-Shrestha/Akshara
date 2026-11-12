@@ -141,7 +141,14 @@ non-commercial, no-derivatives, not-redistributable or unknown licenses carry
 `"train_only": true`. They're used for training and **never published** in the
 corpus. Today that covers eBible Limbu, Sunwar and Tamang (CC BY-NC-ND 3.0),
 NepTam Tamang (CC BY-NC 4.0), and any file missing from the manifests.
-The release script must drop these rows. Note: training on NC data may
+The release script must drop these rows. "All rights reserved" sources crawled for training
+(e.g. NepalMandal) are also train-only.
+
+**Crawling policy.** We crawl only sites that haven't opted out. We respect
+robots.txt and crawl-delay, use a self-identifying research user agent,
+and never bypass logins or anti-bot measures. Sites that reserve rights against
+AI training (e.g. Nepalbhasa Times `Content-Signal: ai-train=no`, Gorkhapatra
+blocking AI crawlers) are **excluded unless the publisher gives written permission**. Note: training on NC data may
 also restrict commercial use of the resulting model. Revisit before any
 commercial use.
 
