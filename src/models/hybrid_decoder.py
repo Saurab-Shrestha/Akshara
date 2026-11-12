@@ -57,11 +57,12 @@ with fla-org's implementation:
 Our PyTorch version is correct but runs the T-loop in Python (slow for long
 sequences). FLA's Triton kernel does the same math in one GPU pass.
 
-PARAMETER COUNT
----------------
-  12 layers: 9 GDNBlock (807k each) + 3 TransformerBlock (705k each) ≈ 9.4M
-  Token embedding (248k × 768)                                        ≈ 190M
-  Total unique                                                         ≈ 200M
+PARAMETER COUNT (v2 config: 32 layers, n_embed 1024, 32k vocab)
+----------------------------------------------------------------
+  32 layers: 24 GDNBlock + 8 TransformerBlock                ≈ 393.0M
+  Token embedding (32,768 × 1024, tied with lm_head)          ≈  33.6M
+  Total unique                                                ≈ 426.6M
+  (v1 used Qwen's 248k vocab: the embedding alone was 190M.)
 """
 
 from __future__ import annotations
@@ -84,6 +85,7 @@ def _build_layers(
     max_seq_len: int,
     attn_every:  int = 4,
     use_fla:     bool = False,
+    qk_norm:     bool = False,
 ) -> nn.ModuleList:
     """
     Build the 3:1 hybrid layer stack.
@@ -96,6 +98,7 @@ def _build_layers(
         max_seq_len:causal mask size (attention blocks only)
         attn_every: place a standard attention block every N layers (default 4 = 3:1 ratio)
         use_fla:    use FLA Triton kernel for GDN layers (GPU training speedup)
+        qk_norm:    QK-norm in the attention blocks (v2)
 
     Returns:
         ModuleList of alternating GDNBlock and TransformerBlock
@@ -103,7 +106,7 @@ def _build_layers(
     layers = []
     for i in range(n_layers):
         if (i + 1) % attn_every == 0:
-            layers.append(TransformerBlock(n_embed, n_heads, n_kv_heads, max_seq_len))
+            layers.append(TransformerBlock(n_embed, n_heads, n_kv_heads, max_seq_len, qk_norm))
         else:
             layers.append(GDNBlock(n_embed, n_heads, use_fla=use_fla))
     return nn.ModuleList(layers)
@@ -121,6 +124,7 @@ class HybridDecoder(nn.Module):
         max_seq_len: int,
         attn_every:  int = 4,
         use_fla:     bool = False,
+        qk_norm:     bool = False,
     ):
         """
         Args:
@@ -132,6 +136,7 @@ class HybridDecoder(nn.Module):
             max_seq_len: maximum sequence length
             attn_every:  full attention every N layers (4 = 3:1 ratio)
             use_fla:     use FLA Triton kernel for GDN layers
+            qk_norm:     QK-norm in attention blocks (v2; False keeps v1 checkpoints loadable)
         """
         super().__init__()
         self.n_embed     = n_embed
@@ -142,7 +147,7 @@ class HybridDecoder(nn.Module):
 
         self.layers = _build_layers(
             n_layers, n_embed, n_heads, n_kv_heads, max_seq_len, attn_every,
-            use_fla=use_fla,
+            use_fla=use_fla, qk_norm=qk_norm,
         )
 
         self.norm    = RMSNorm(n_embed)
@@ -378,15 +383,16 @@ class HybridDecoder(nn.Module):
 
 
 # ── default config ─────────────────────────────────────────────────────────────
-DEFAULT_CONFIG = dict(
-    vocab_size  = 248_077,
-    n_embed     = 768,
-    n_heads     = 12,
-    n_kv_heads  = 3,
-    n_layers    = 12,
-    max_seq_len = 512,
+DEFAULT_CONFIG = dict(   # v2 — mirrors configs/base.json
+    vocab_size  = 32_768,
+    n_embed     = 1024,
+    n_heads     = 16,
+    n_kv_heads  = 4,
+    n_layers    = 32,
+    max_seq_len = 1024,
     attn_every  = 4,   # 3:1 ratio
     use_fla     = False,
+    qk_norm     = True,
 )
 
 

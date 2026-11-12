@@ -1,5 +1,14 @@
 # Akshara — OCR Fine-Tune Plan (Stage 2 → 3)
 
+> **v2 note (2026-11):** the project is now a from-scratch multimodal LLM, see
+> **[ROADMAP_V2.md](ROADMAP_V2.md)**. This document's *data plan* (ocr-mlt-50m,
+> Mozhi-LR, heiDATA eval, synthetic supplement, teacher baselines) is still the
+> plan for the **OCR task inside stage 5 instruction tuning**. Its decoder
+> references (`pretrain_a100_v4.pt`, Qwen vocab, 16 layers) are v1. Use the v2
+> decoder (`Saurab0/akshara-pretrain-v2`) instead. `train_ocr.py` does not
+> back up to HF yet, so add that before any long run.
+
+
 Status as of this doc: **Stage 1 (language pretrain) is DONE.** The decoder
 prior lives at `Saurab0/akshara-pretrain` on HF (step 5400, ~540M tokens, dev
 ppl ≈ 6.7; strong Nepali, functional English — see the language-eval results).

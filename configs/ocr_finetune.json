@@ -7,9 +7,10 @@
   "train_steps": 20000,
   "eval_steps": 250,
   "warmup_steps": 500,
-  "lr": 1e-4,
-  "min_lr": 1e-5,
-  "pretrain_ckpt": "checkpoints/pretrain.pt",
+  "lr": 0.0001,
+  "min_lr": 1e-05,
+  "pretrain_ckpt": "checkpoints/pretrain_v2.pt",
   "out_ckpt": "checkpoints/ocr.pt",
-  "log_dir": "logs/ocr"
+  "log_dir": "logs/ocr",
+  "optimizer": "muon"
 }

@@ -1,5 +1,11 @@
 # 07 · Hybrid Decoder
 
+> **v2 note:** the numbers in this chapter are the original 12-layer, 248k-vocab
+> walkthrough. The v2 decoder is **32 layers × 1024 wide (24 GDN + 8 attention),
+> 32k own vocab, QK-norm → ~427M params (393M body, 34M embedding)**. The 3:1
+> mechanics described here are unchanged. See [ROADMAP_V2.md](ROADMAP_V2.md).
+
+
 The full text model: 3:1 GDN + Attention hybrid with weight tying and vision prefix support.
 
 **Files:** [`src/models/hybrid_decoder.py`](../src/models/hybrid_decoder.py),

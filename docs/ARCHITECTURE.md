@@ -1,6 +1,13 @@
 # Akshara (अक्षर) — Architecture
 
-Devanagari + English document OCR: **page image → structured HTML**.
+A small multimodal LLM built from scratch. Its first job is Devanagari + English document OCR: **page image → structured HTML**.
+
+> **v2 update (2026-11):** the project grew from an OCR recognizer into
+> a from-scratch multimodal LLM. Plan and rationale:
+> **[ROADMAP_V2.md](ROADMAP_V2.md)**. What changed in this doc: own 32k
+> tokenizer (§2.5), 427M decoder with QK-norm + fused attention (§2.4), Muon,
+> packed-token pretraining (§3). The vision side, connector, crop pipeline
+> and OCR data strategy below are unchanged.
 
 > **Project goal is learning, not competition.** Strong open multilingual OCR
 > models already exist (PaddleOCR-VL, Nemotron-OCR). Akshara is built to
@@ -8,9 +15,9 @@ Devanagari + English document OCR: **page image → structured HTML**.
 > recognizer ourselves, and use the existing models/datasets as baselines and
 > teachers, not as things to out-perform.
 
-> **Status:** Stage 1 (language pretrain) is **complete**. The decoder prior is
-> on HF at `Saurab0/akshara-pretrain` (~540M tokens, dev ppl ≈ 6.7; strong
-> Nepali, functional English). Next up: Stage 2 (crop recognizer).
+> **Status:** v1 language pretrain is **complete** (`Saurab0/akshara-pretrain`,
+> ~540M tokens, dev ppl ≈ 6.7). v2 code for corpus → tokenizer → pack →
+> pretrain is done and smoke-tested; the v2 pretrain run is next.
 
 Akshara composes pretrained, language-agnostic *structure* models with a
 custom-trained *recognizer*. Structure (paragraphs, headings, tables)
@@ -59,11 +66,11 @@ shrinks to "read what you see."
 ```mermaid
 flowchart LR
     A["crop<br/>3×448×448"] --> B["DINOv2-S/14 encoder<br/><i>pretrained</i><br/>32×32 = 1024 patches<br/>dim 384"]
-    B --> C["Connector<br/>MLP 384→768<br/>+ RMSNorm gain 0.02"]
-    C --> D["visual prefix<br/>1024 × 768"]
-    D --> E["HybridDecoder<br/>16 layers, dim 768<br/>GDN:attention 3:1"]
+    B --> C["Connector<br/>MLP 384→768→1024<br/>+ RMSNorm gain 0.02"]
+    C --> D["visual prefix<br/>1024 × 1024"]
+    D --> E["HybridDecoder v2<br/>32 layers, dim 1024<br/>GDN:attention 3:1"]
     T["text tokens so far"] --> E
-    E --> F["next-token logits<br/>vocab 248 077"]
+    E --> F["next-token logits<br/>vocab 32 768"]
 ```
 
 ### 2.1 Input preprocessing — aspect-preserving pad, never squash
@@ -95,23 +102,25 @@ padding/masking. Do it when padding waste measurably hurts throughput.
   Devanagari. (Surya 2's card doesn't disclose its encoder init, so it
   offers no counter-evidence.)
 - DINOv2 uses the same ImageNet mean/std normalization as our datasets.
-- Budget check: 1024 visual + 512 text = 1536, well under the `4 × max_seq_len`
-  (2048) the decoder's RoPE tables and causal mask are sized for (headroom for
-  518px input = 1369 patches).
+- Budget check: 1024 visual + 1024 text = 2048, well under the `4 × max_seq_len`
+  (4096) the decoder's RoPE tables are sized for.
 
 ### 2.3 Connector (~0.9 M params)
 
-Two-layer MLP (384 → 768 → 768, GELU) followed by an **RMSNorm with gain
+Two-layer MLP (384 → 768 → 1024, GELU) followed by an **RMSNorm with gain
 initialized to 0.02**. Token embeddings have per-dim std 0.02; without this
 norm the visual prefix enters the residual stream ~5× hotter than text and
 drowns it out early in training.
 
-### 2.4 HybridDecoder (~308 M params, 190 M of which is the embedding table)
+### 2.4 HybridDecoder v2 (~427 M params: 393 M body + 34 M embedding)
 
-16 layers alternating **Gated DeltaNet (GDN)** and full attention, 3:1
-(`attn_every=4` → layers 3, 7, 11, 15 are attention):
+32 layers, width 1024, alternating **Gated DeltaNet (GDN)** and full
+attention 3:1 (`attn_every=4` → every 4th layer is attention). Deep-and-thin
+on purpose: below ~1B params, depth beats width at equal size (MobileLLM).
+v1 was 16 × 768 with a 190 M embedding (Qwen vocab), pinned in
+`configs/a100_pretrain.json`.
 
-- **GDN layers** (12): O(T) recurrence with a per-head memory matrix
+- **GDN layers** (24): O(T) recurrence with a per-head memory matrix
   `S ← α·S + β·(v − S·k)kᵀ` — erase-then-write associative memory.
   - Forget gate α uses `bias=+4` init → `sigmoid(4)≈0.98` — memory survives
     ~50 tokens at init instead of halving every step.
@@ -123,10 +132,17 @@ drowns it out early in training.
     pure-Python recurrence. The Python loop is retained as the CPU/Mac fallback
     (`use_fla=False`). Note: FLA is Triton/CUDA-only, so the trained weights
     only load on a GPU box; CPU/Mac inference will need a weight-converter.
-- **Attention layers** (4): exact-recall checkpoints. GQA 12 query / 3 KV
+- **Attention layers** (8): exact-recall checkpoints. GQA 16 query / 4 KV
   heads, RoPE (real cos/sin tables — complex tensors break DataParallel
-  buffer replication). Tables sized `max_seq_len × 4` (2048) to cover a
-  visual prefix (up to 1369 patches at 518px) + text.
+  buffer replication). Tables sized `max_seq_len × 4` (4096) to cover a
+  visual prefix + text.
+  - **QK-norm** (v2): Q and K are RMS-normalised per head before RoPE, which
+    bounds the attention logits. This is the standard fix for loss spikes
+    (Qwen3, OLMo-2, Gemma-3).
+  - **Fused SDPA** (v2): `F.scaled_dot_product_attention(is_causal=True,
+    enable_gqa=True)` runs FlashAttention, so it never builds the T×T matrix or
+    copies KV heads. The hand-written version is kept as `_reference_attention`
+    and the self-check asserts the two match.
 - Weight-tied embedding/LM head; depth-scaled init (`0.02/√(2·n_layers)`)
   on residual output projections.
 - Loss: cross-entropy with `ignore_index=-100`. Datasets mark every target
@@ -134,17 +150,29 @@ drowns it out early in training.
   positions are "predict EOS given EOS" and the model learns to emit empty
   pages.
 
-### 2.5 Tokenizer
+### 2.5 Tokenizer — our own 32k byte-level BPE (v2)
 
-`Qwen/Qwen3.5-0.8B` — multilingual BPE, handles Devanagari well.
-`len(tokenizer)` = **248 077** (the single source of truth for `vocab_size`;
-`bos_token_id` is `None`, so EOS doubles as the BOS sentinel everywhere).
-The 190 M-parameter embedding table is the price of this vocabulary; a
-trimmed Nepali-focused vocab is a possible future optimization.
+`tokenizer/akshara-bpe`, trained by `scripts/train_tokenizer.py` on our own
+corpus: NFC normalisation, a pre-tokenizer split that keeps matras, virama
+and ZWJ attached to their consonants, and digits grouped 1–3. Special tokens:
+`<|bos|>`=0, `<|eos|>`=1, `<|pad|>`=2, `<|image|>`, `<|im_start|>`,
+`<|im_end|>`, plus 10 reserved, so stages 4–5 never resize the embedding.
+
+Why it replaced Qwen's 248k vocab: on Devanagari, Qwen gets 1.46 chars/token
+and ours gets 3.52, and the embedding drops from 190M to 34M params. Details:
+[02_tokenizer.md](02_tokenizer.md). v1 checkpoints carry
+`tokenizer: Qwen/Qwen3.5-0.8B` in their config (default when absent).
 
 ---
 
 ## 3. Training curriculum
+
+> **v2:** the full stage list is now corpus → tokenizer → pack → pretrain →
+> align → instruct ([ROADMAP_V2.md](ROADMAP_V2.md)). Pretraining uses packed
+> uint16 token shards (`scripts/tokenize_corpus.py` + `PackedTokenDataset`)
+> and Muon on the decoder's hidden matrices (`src/optim.py`). The OCR
+> curriculum below (lines → paragraphs → real) becomes the OCR task inside
+> stage 5 instruction tuning.
 
 ```mermaid
 flowchart LR
@@ -245,13 +273,15 @@ work at small scale.
 
 ```
 akshara/
-├── config/config.py          # dataclass configs (vocab 248077, seq 512, img 448)
+├── config/config.py          # dataclass configs (defaults = v1; v2 set in configs/base.json)
 ├── configs/*.json             # per-stage overrides
 ├── scripts/
-│   ├── pretrain.py            # Stage 1 (text-only LM), HF-backup on save
+│   ├── pretrain.py            # decoder LM pretraining, HF-backup on save
+│   ├── train_tokenizer.py     # own byte-level BPE (v2)
+│   ├── tokenize_corpus.py     # JSONL → packed uint16 .bin (v2)
 │   ├── train_ocr.py           # Stages 2A/2B/3 (crop OCR)
 │   ├── generate.py            # single-image inference
-│   ├── prepare_data.py        # corpus download (FineWeb-2 + FineWeb-Edu + Wiki)
+│   ├── prepare_data.py        # streaming char-budgeted corpus (FineWeb-2/Edu, FineMath, Wiki)
 │   ├── hf_uploader.py         # detached checkpoint backup to HF Hub
 │   ├── lm_sample.py           # quick language sanity check
 │   └── lm_eval.py             # thorough language eval (gen + perplexity pairs)
@@ -261,13 +291,14 @@ akshara/
 │   │   ├── connector.py       # MLP bridge + scale-matching RMSNorm
 │   │   ├── hybrid_decoder.py  # 3:1 GDN/attention decoder
 │   │   ├── gdn_block.py       # Gated DeltaNet (fp32 recurrence)
-│   │   ├── attention.py       # GQA + RoPE
+│   │   ├── attention.py       # GQA + RoPE + QK-norm, fused SDPA
 │   │   ├── rope.py            # real cos/sin tables
 │   │   └── vlm.py             # Akshara = encoder+connector+decoder
 │   ├── data/
-│   │   ├── text_dataset.py    # Stage 1 JSONL
+│   │   ├── text_dataset.py    # PackedTokenDataset (.bin) + JSONL
 │   │   ├── ocr_dataset.py     # CropOCRDataset, pad_to_square
 │   │   └── synth_data.py      # synthetic crop generator (supplement)
+│   ├── optim.py               # Muon (hidden matrices) + AdamW (rest)
 │   └── pipeline.py            # Surya layout → recognizer → HTML
 └── kaggle_run.py              # legacy Kaggle entry point (unused; on Lightning now)
 ```
@@ -283,7 +314,8 @@ akshara/
 - **Ephemeral-machine playbook** (learned the hard way — a 9h run was lost
   once): the training box's disk and conda env do **not** survive a session
   end. So:
-  - **Back up to HF every checkpoint** (`--hf_repo Saurab0/akshara-pretrain`,
+  - **Back up to HF every checkpoint** (`hf_repo` in the run config — v2:
+    `Saurab0/akshara-pretrain-v2`; it defaults to off so smoke runs never upload,
     write-scoped token, `huggingface-cli login`). The HF namespace is
     **case-sensitive** (`Saurab0` ≠ `saurab0`).
   - **Reinstall `flash-linear-attention==0.5.1` each new machine** — the

@@ -50,18 +50,20 @@ from src.models.rms_norm import RMSNorm
 
 class TransformerBlock(nn.Module):
 
-    def __init__(self, n_embed: int, n_heads: int, n_kv_heads: int, max_seq_len: int):
+    def __init__(self, n_embed: int, n_heads: int, n_kv_heads: int, max_seq_len: int,
+                 qk_norm: bool = False):
         """
         Args:
             n_embed:     embedding dimension
             n_heads:     number of query attention heads
             n_kv_heads:  number of key/value heads (GQA)
             max_seq_len: maximum sequence length (passed to attention for causal mask)
+            qk_norm:     RMS-normalise Q/K per head inside attention (v2)
         """
         super().__init__()
         # Pre-norm before attention
         self.norm1 = RMSNorm(n_embed)
-        self.attn  = MultiHeadAttention(n_embed, n_heads, n_kv_heads, max_seq_len)
+        self.attn  = MultiHeadAttention(n_embed, n_heads, n_kv_heads, max_seq_len, qk_norm)
 
         # Pre-norm before MLP
         self.norm2 = RMSNorm(n_embed)

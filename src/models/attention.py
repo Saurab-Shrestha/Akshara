@@ -67,24 +67,51 @@ After reshape:  (batch, n_heads, seq_len, head_dim)     [Q]
 After attention:(batch, n_heads, seq_len, head_dim)
 After concat:   (batch, seq_len, n_embed)
 After out proj: (batch, seq_len, n_embed)
+
+QK-NORM (v2)
+------------
+With qk_norm=True, Q and K are RMS-normalised per head before RoPE.
+Unbounded Q·K dot products are the classic source of loss spikes
+(attention logits blow up, softmax saturates). Normalising Q and K keeps
+the logits bounded — used by Qwen3, OLMo-2, Gemma-3.
+
+FUSED KERNEL (v2)
+-----------------
+Steps 1–4 above are written out by hand in `_reference_attention` (kept
+for learning + the self-check). Training calls
+F.scaled_dot_product_attention, which does the same math in one fused
+FlashAttention kernel and never materialises the T×T score matrix.
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from src.models.rms_norm import RMSNorm
 from src.models.rope import apply_rope
+
+
+def _reference_attention(q, k, v):
+    """The hand-written math: softmax(QKᵀ/√d + causal mask)·V. q,k,v: (B, H, T, D)."""
+    T = q.shape[-2]
+    scores = (q @ k.transpose(-2, -1)) * q.shape[-1] ** -0.5
+    mask = torch.tril(torch.ones(T, T, dtype=torch.bool, device=q.device))
+    scores = scores.masked_fill(~mask, float("-inf"))
+    return F.softmax(scores, dim=-1) @ v
 
 
 class MultiHeadAttention(nn.Module):
 
-    def __init__(self, n_embed: int, n_heads: int, n_kv_heads: int, max_seq_len: int):
+    def __init__(self, n_embed: int, n_heads: int, n_kv_heads: int, max_seq_len: int,
+                 qk_norm: bool = False):
         """
         Args:
             n_embed:     total embedding dimension
             n_heads:     number of query heads
             n_kv_heads:  number of key/value heads (< n_heads for GQA)
-            max_seq_len: maximum sequence length (for causal mask)
+            max_seq_len: unused since the fused kernel builds the mask itself;
+                         kept so call sites stay unchanged
+            qk_norm:     RMS-normalise Q and K per head (v2)
         """
         super().__init__()
         assert n_embed % n_heads == 0, "n_embed must be divisible by n_heads"
@@ -105,12 +132,8 @@ class MultiHeadAttention(nn.Module):
         # Output projection: concatenated heads → n_embed
         self.wo = nn.Linear(n_heads * self.head_dim, n_embed, bias=False)
 
-        # Causal mask: lower-triangular matrix of True.
-        # Built for 4× max_seq_len to cover visual prefix + text sequence
-        # at up to 518px input (1369 patches) without recomputing at runtime.
-        _mask_len = max_seq_len * 4
-        mask = torch.tril(torch.ones(_mask_len, _mask_len, dtype=torch.bool))
-        self.register_buffer("causal_mask", mask)
+        self.q_norm = RMSNorm(self.head_dim) if qk_norm else None
+        self.k_norm = RMSNorm(self.head_dim) if qk_norm else None
 
     def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
         """
@@ -134,44 +157,33 @@ class MultiHeadAttention(nn.Module):
         k = k.view(B, T, self.n_kv_heads, self.head_dim)
         v = v.view(B, T, self.n_kv_heads, self.head_dim)
 
+        if self.q_norm is not None:
+            q = self.q_norm(q)
+            k = self.k_norm(k)
+
         # ── Apply RoPE to Q and K (not V — V carries content, not position) ─
         q = apply_rope(q, cos, sin)
         k = apply_rope(k, cos, sin)
 
-        # ── Expand K and V for GQA ──────────────────────────────────────────
-        # Each KV head needs to be repeated n_rep times to match query heads
-        # (B, T, n_kv_heads, head_dim) → (B, T, n_heads, head_dim)
-        if self.n_rep > 1:
-            k = k.repeat_interleave(self.n_rep, dim=2)
-            v = v.repeat_interleave(self.n_rep, dim=2)
-
-        # ── Rearrange for batch matrix multiply: put heads before seq_len ───
-        # (B, T, n_heads, head_dim) → (B, n_heads, T, head_dim)
+        # ── (B, T, heads, head_dim) → (B, heads, T, head_dim) ───────────────
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
 
-        # ── Scaled dot-product attention ─────────────────────────────────────
-        # scores: (B, n_heads, T, T)
-        scale  = self.head_dim ** -0.5
-        scores = torch.matmul(q, k.transpose(-2, -1)) * scale
-
-        # Apply causal mask: positions where mask is False get -inf
-        # (future tokens become invisible after softmax)
-        scores = scores.masked_fill(~self.causal_mask[:T, :T], float("-inf"))
-
-        # Softmax → attention weights (each row sums to 1)
-        weights = F.softmax(scores, dim=-1)
-
-        # Weighted sum of values
-        # (B, n_heads, T, T) × (B, n_heads, T, head_dim) → (B, n_heads, T, head_dim)
-        out = torch.matmul(weights, v)
+        # ── Fused causal attention. enable_gqa shares each KV head across
+        #    n_rep query heads without materialising repeated K/V copies.
+        out = F.scaled_dot_product_attention(
+            q, k, v, is_causal=True, enable_gqa=self.n_rep > 1,
+        )
 
         # ── Merge heads and project ──────────────────────────────────────────
-        # (B, n_heads, T, head_dim) → (B, T, n_heads * head_dim)
         out = out.transpose(1, 2).contiguous().view(B, T, -1)
-
         return self.wo(out)  # (B, T, n_embed)
+
+    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+        # v1 checkpoints stored the causal mask as a buffer; it no longer exists.
+        state_dict.pop(prefix + "causal_mask", None)
+        super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
 
 
 # ── self-check ────────────────────────────────────────────────────────────────
@@ -181,7 +193,7 @@ if __name__ == "__main__":
     batch, seq_len, n_embed = 2, 16, 256
     n_heads, n_kv_heads     = 8, 2   # GQA: 4 query heads per KV head
 
-    attn      = MultiHeadAttention(n_embed, n_heads, n_kv_heads, max_seq_len=seq_len)
+    attn      = MultiHeadAttention(n_embed, n_heads, n_kv_heads, max_seq_len=seq_len, qk_norm=True)
     cos, sin = precompute_freqs_cis(dim=n_embed // n_heads, max_seq_len=seq_len)
 
     x   = torch.randn(batch, seq_len, n_embed)
@@ -196,6 +208,17 @@ if __name__ == "__main__":
     out2 = attn(x2, cos, sin)
     diff_at_pos0 = (out[:, 0, :] - out2[:, 0, :]).abs().max().item()
     assert diff_at_pos0 < 1e-4, f"position 0 was affected by position 5 — causal mask broken! diff={diff_at_pos0}"
+
+    # Fused kernel must match the hand-written math
+    q = torch.randn(batch, n_heads, seq_len, n_embed // n_heads)
+    k = torch.randn(batch, n_heads, seq_len, n_embed // n_heads)
+    v = torch.randn(batch, n_heads, seq_len, n_embed // n_heads)
+    fused = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+    assert torch.allclose(fused, _reference_attention(q, k, v), atol=1e-5), "SDPA != reference"
+
+    # v1 checkpoints carried a causal_mask buffer — must still load
+    sd = attn.state_dict(); sd["causal_mask"] = torch.ones(1)
+    attn.load_state_dict(sd)
 
     print("MultiHeadAttention self-check passed.")
     print(f"  input  shape : {x.shape}")

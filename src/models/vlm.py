@@ -82,6 +82,7 @@ class Akshara(nn.Module):
         max_seq_len: int = 512,
         attn_every:  int = 4,
         use_fla:     bool = False,
+        qk_norm:     bool = False,
     ):
         super().__init__()
 
@@ -109,6 +110,7 @@ class Akshara(nn.Module):
             max_seq_len = max_seq_len,
             attn_every  = attn_every,
             use_fla     = use_fla,
+            qk_norm     = qk_norm,
         )
 
     def forward(

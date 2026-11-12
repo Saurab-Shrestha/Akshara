@@ -1,34 +1,34 @@
 """
-Data preparation for Akshara — SmolLM-style quality-centric approach.
+Data preparation for Akshara — streaming, token-budgeted corpus (v2).
 
-Downloads and mixes multilingual text corpora with education-quality filtering.
+WHY v2
+------
+v1 collected ~965k docs into a Python list (~80–100M tokens) and the
+pretrain run cycled over it ~5×. v2 targets 3B+ *unique* tokens, so:
+    - budgets are in characters (≈ tokens × 3.5 with our BPE), not docs —
+      a Wikipedia article and a forum post are not the same "1 doc"
+    - each doc is streamed straight to disk; nothing is held in RAM
+    - the val split is a deterministic hash of the text (1 in 200), so it
+      spans every source even though sources are written one after another
 
-SOURCES:
-    FineWeb-2:    Multilingual web with quality scores.
-                  Primary source for Devanagari script languages.
-    FineWeb-Edu:  Education-filtered English web (EduScore >= 3).
-    Wikipedia:    Clean articles for all target languages (supplement).
+SOURCES (share of total characters)
+-----------------------------------
+    FineWeb-2   ne 30% · hi 25% · mr 4% · sa 1%   (length-filtered)
+    FineWeb-Edu en 30%                             (EduScore ≥ 3)
+    FineMath    3%     (finemath-4plus: digits, equations, reasoning text)
+    Wikipedia   ne 3% · hi 2% · en 2%              (curated)
 
-QUALITY FILTER:
-    FineWeb-2: length-filtered only. FineWeb-2 exposes no single EduScore
-               field, so QUALITY_THRESHOLD does not apply here.
-    FineWeb-Edu: score >= QUALITY_THRESHOLD (EduScore 0-5).
-    Wikipedia: no filtering (already curated).
+English is 30%+ (up from v1's 20%) because the MLLM instruction data
+(LLaVA, Cauldron, Docmatix) is mostly English. If a source runs dry before
+its budget (FineWeb-2 Nepali may), the script says so and moves on.
 
-DATA MIX (1M docs default):
-    70%  FineWeb-2 Devanagari (ne, hi, mr, sa)
-    20%  FineWeb-Edu          (English, high-quality)
-    10%  Wikipedia            (mixed ne, hi, en, mr, sa)
+USAGE
+-----
+    # ~12B chars ≈ 3.4B tokens (~30 GB of JSONL on disk)
+    PYTHONPATH=. python scripts/prepare_data.py --out_dir data/corpus_v5
 
-USAGE:
-    # Default 1M docs
-    PYTHONPATH=. python scripts/prepare_data.py
-
-    # Custom size
-    PYTHONPATH=. python scripts/prepare_data.py --max_samples 500000 --out_dir data/corpus_v4
-
-    # Custom quality threshold
-    PYTHONPATH=. python scripts/prepare_data.py --quality 4
+    # tiny smoke corpus
+    PYTHONPATH=. python scripts/prepare_data.py --total_chars 2e6 --out_dir /tmp/corpus_smoke
 """
 
 from __future__ import annotations
@@ -36,225 +36,101 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import random
-from pathlib import Path
+import time
+import zlib
 
-# Minimum EduScore quality threshold (0–5, higher = more educational)
 QUALITY_THRESHOLD = 3
 
-# FineWeb-2 configs for Devanagari script languages
-_FINEWEB2_DEVANAGARI = {
-    "ne": "npi_Deva",
-    "hi": "hin_Deva",
-    "mr": "mar_Deva",
-    "sa": "san_Deva",
-}
-
-# Wikipedia language codes
-_WIKI_CONFIGS = {
-    "ne": "20231101.ne",
-    "hi": "20231101.hi",
-    "en": "20231101.en",
-    "mr": "20231101.mr",
-    "sa": "20231101.sa",
-}
+# (label, loader, loader-arg, share of total chars)
+MIX = [
+    ("fineweb2/ne",  "fineweb2", "npi_Deva", 0.30),
+    ("fineweb2/hi",  "fineweb2", "hin_Deva", 0.25),
+    ("fineweb2/mr",  "fineweb2", "mar_Deva", 0.04),
+    ("fineweb2/sa",  "fineweb2", "san_Deva", 0.01),
+    ("fineweb-edu",  "edu",      None,       0.30),
+    ("finemath",     "math",     None,       0.03),
+    ("wiki/ne",      "wiki",     "20231101.ne", 0.03),
+    ("wiki/hi",      "wiki",     "20231101.hi", 0.02),
+    ("wiki/en",      "wiki",     "20231101.en", 0.02),
+]
+assert abs(sum(m[3] for m in MIX) - 1.0) < 1e-9
 
 
-def _load_fineweb2(config: str, max_samples: int) -> list[str]:
-    """Load documents from FineWeb-2 (length-filtered; no EduScore field)."""
+def stream_texts(kind: str, arg: str | None, quality: int):
+    """Yield cleaned document texts (≥50 chars) from one HF source, streaming."""
     from datasets import load_dataset
 
-    try:
-        ds = load_dataset(
-            "HuggingFaceFW/fineweb-2", config, split="train", streaming=True,
-        )
-    except Exception as e:
-        print(f"    [warn] cannot load FineWeb-2 '{config}': {e}")
-        return []
+    if kind == "fineweb2":
+        ds = load_dataset("HuggingFaceFW/fineweb-2", arg, split="train", streaming=True)
+    elif kind == "edu":
+        ds = load_dataset("HuggingFaceFW/fineweb-edu", "sample-100BT", split="train", streaming=True)
+    elif kind == "math":
+        ds = load_dataset("HuggingFaceTB/finemath", "finemath-4plus", split="train", streaming=True)
+    elif kind == "wiki":
+        ds = load_dataset("wikimedia/wikipedia", arg, split="train", streaming=True)
+    else:
+        raise ValueError(kind)
 
-    texts: list[str] = []
     it = iter(ds)
-    i = 0
-    while len(texts) < max_samples:
+    while True:
         try:
             sample = next(it)
         except StopIteration:
-            break
+            return
         except Exception as e:
+            # FineWeb-2 shards occasionally have schema drift; skip the bad row
             if "Cast" in type(e).__name__ or "Schema" in type(e).__name__:
                 continue
             raise
-        i += 1
-        text = sample.get("text")
-        if text is None:
-            continue
-        text = text.strip()
-        if len(text) >= 50:
-            texts.append(text)
-        if i % 10000 == 0:
-            print(f"    ... {i} scanned, {len(texts)} kept")
-    return texts
-
-
-def _load_fineweb_edu(
-    max_samples: int, min_quality: int,
-) -> list[str]:
-    """Load English documents from FineWeb-Edu filtered by EduScore."""
-    from datasets import load_dataset
-
-    ds = load_dataset(
-        "HuggingFaceFW/fineweb-edu", "sample-100BT",
-        split="train", streaming=True,
-    )
-    texts: list[str] = []
-    for sample in ds:
-        if len(texts) >= max_samples:
-            break
-        score = sample.get("score")
-        if score is not None and score < min_quality:
+        if kind == "edu" and (sample.get("score") or 0) < quality:
             continue
         text = (sample.get("text") or "").strip()
         if len(text) >= 50:
-            texts.append(text)
-    return texts
+            yield text
 
 
-def _load_wiki(lang: str, max_samples: int) -> list[str]:
-    """Load Wikipedia articles for a language."""
-    from datasets import load_dataset
-
-    config = _WIKI_CONFIGS.get(lang)
-    if config is None:
-        return []
-
-    ds = load_dataset(
-        "wikimedia/wikipedia", config, split="train", streaming=True
-    )
-    texts: list[str] = []
-    for sample in ds:
-        if len(texts) >= max_samples:
-            break
-        text = (sample.get("text") or "").strip()
-        if len(text) >= 50:
-            texts.append(text)
-    return texts
+def is_val(text: str) -> bool:
+    return zlib.crc32(text.encode("utf-8")) % 200 == 0
 
 
-def _write_jsonl(texts: list[str], path: str):
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        for t in texts:
-            f.write(json.dumps({"text": t}, ensure_ascii=False) + "\n")
+def prepare_corpus(total_chars: float, out_dir: str, quality: int):
+    os.makedirs(out_dir, exist_ok=True)
+    stats = {}
+    with open(os.path.join(out_dir, "train.jsonl"), "w", encoding="utf-8") as ftr, \
+         open(os.path.join(out_dir, "val.jsonl"), "w", encoding="utf-8") as fva:
+        for label, kind, arg, share in MIX:
+            budget = int(total_chars * share)
+            got, docs, t0 = 0, 0, time.time()
+            print(f"[{label}] target {budget/1e6:,.0f}M chars")
+            try:
+                for text in stream_texts(kind, arg, quality):
+                    (fva if is_val(text) else ftr).write(
+                        json.dumps({"text": text}, ensure_ascii=False) + "\n")
+                    got += len(text)
+                    docs += 1
+                    if docs % 50_000 == 0:
+                        print(f"    {docs:,} docs | {got/1e6:,.0f}M chars | {time.time()-t0:.0f}s")
+                    if got >= budget:
+                        break
+            except Exception as e:
+                print(f"    [warn] {label} failed after {docs:,} docs: {e}")
+            if got < budget:
+                print(f"    [warn] {label} exhausted at {got/1e6:,.0f}M / {budget/1e6:,.0f}M chars")
+            stats[label] = (docs, got)
 
-
-def prepare_corpus(
-    max_samples: int = 200_000,
-    seed: int = 42,
-    val_ratio: float = 0.05,
-    out_dir: str = "data/corpus",
-    quality: int = QUALITY_THRESHOLD,
-):
-    """
-    Download a multilingual corpus with SmolLM-style quality filtering.
-
-    Data mix:
-        - 70% FineWeb-2 Devanagari (ne, hi, mr, sa)
-        - 20% FineWeb-Edu English
-        - 10% Wikipedia (multilingual)
-    """
-    rng = random.Random(seed)
-    out = Path(out_dir)
-
-    n_fw2 = int(max_samples * 0.70)
-    n_edu = int(max_samples * 0.20)
-    n_wiki = int(max_samples * 0.10)
-
-    all_texts: list[str] = []
-
-    # --- FineWeb-2 Devanagari ---
-    fw2_targets = {
-        "ne (Nepali)": int(n_fw2 * 0.38),
-        "hi (Hindi)": int(n_fw2 * 0.38),
-        "mr (Marathi)": int(n_fw2 * 0.16),
-        "sa (Sanskrit)": int(n_fw2 * 0.08),
-    }
-    for label, target in fw2_targets.items():
-        lang_code = label.split(" ")[0]
-        config = _FINEWEB2_DEVANAGARI.get(lang_code)
-        if config is None or target == 0:
-            continue
-        print(f"  [FineWeb-2 {label}] loading {target:,} docs...")
-        try:
-            texts = _load_fineweb2(config, target)
-            print(f"    → got {len(texts):,} docs")
-            all_texts.extend(texts)
-        except Exception as e:
-            print(f"    [warn] failed to load FineWeb-2 {config}: {e}")
-            continue
-
-    # --- FineWeb-Edu English ---
-    print(f"  [FineWeb-Edu] loading {n_edu:,} docs (quality>={quality})...")
-    edu_texts = _load_fineweb_edu(n_edu, min_quality=quality)
-    print(f"    → got {len(edu_texts):,} docs")
-    all_texts.extend(edu_texts)
-
-    # --- Wikipedia multilingual ---
-    wiki_langs = {"ne": 0.3, "hi": 0.25, "en": 0.25, "mr": 0.1, "sa": 0.1}
-    for lang_code, ratio in wiki_langs.items():
-        target = int(n_wiki * ratio)
-        if target == 0:
-            continue
-        print(f"  [Wikipedia {lang_code}] loading {target:,} docs...")
-        texts = _load_wiki(lang_code, target)
-        print(f"    → got {len(texts):,} docs")
-        all_texts.extend(texts)
-
-    print(f"\n[data] total collected: {len(all_texts):,} docs")
-
-    # Trim to exact max_samples if oversampled
-    if len(all_texts) > max_samples:
-        rng.shuffle(all_texts)
-        all_texts = all_texts[:max_samples]
-
-    rng.shuffle(all_texts)
-
-    n_val = max(1, int(len(all_texts) * val_ratio))
-    val_docs = all_texts[:n_val]
-    train_docs = all_texts[n_val:]
-
-    _write_jsonl(train_docs, str(out / "train.jsonl"))
-    _write_jsonl(val_docs, str(out / "val.jsonl"))
-    print(f"[data] done — {len(train_docs)} train / {len(val_docs)} val → {out}/")
+    total = sum(c for _, c in stats.values())
+    print(f"\n[data] {total/1e9:.2f}B chars (≈{total/3.5/1e9:.2f}B tokens) → {out_dir}/")
+    for label, (docs, chars) in stats.items():
+        print(f"  {label:<14} {docs:>10,} docs  {chars/1e6:>9,.0f}M chars  {chars/max(1,total):6.1%}")
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Akshara data preparation (SmolLM-style)"
-    )
-    parser.add_argument(
-        "--max_samples", type=int, default=1_000_000,
-        help="Total target document count (default: 1M)",
-    )
-    parser.add_argument(
-        "--out_dir", type=str, default="data/corpus",
-        help="Output directory for the corpus JSONL files",
-    )
-    parser.add_argument(
-        "--quality", type=int, default=QUALITY_THRESHOLD,
-        help="Minimum EduScore quality threshold 0-5 (default: 3)",
-    )
-    parser.add_argument(
-        "--seed", type=int, default=42,
-        help="Random seed for train/val split",
-    )
-    args = parser.parse_args()
-
-    prepare_corpus(
-        max_samples=args.max_samples,
-        seed=args.seed,
-        out_dir=args.out_dir,
-        quality=args.quality,
-    )
+    ap = argparse.ArgumentParser(description="Akshara corpus preparation (streaming, char-budgeted)")
+    ap.add_argument("--total_chars", type=float, default=12e9, help="total character budget (default 12e9 ≈ 3.4B tokens)")
+    ap.add_argument("--out_dir", default="data/corpus_v5")
+    ap.add_argument("--quality", type=int, default=QUALITY_THRESHOLD, help="FineWeb-Edu min EduScore")
+    args = ap.parse_args()
+    prepare_corpus(args.total_chars, args.out_dir, args.quality)
 
 
 if __name__ == "__main__":

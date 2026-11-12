@@ -179,6 +179,7 @@ def main() -> None:
         vision_dim  = saved_config.get("vision_dim",  384),
         vit_layers  = saved_config.get("vit_layers",  12),
         vit_heads   = saved_config.get("vit_heads",   6),
+        qk_norm     = saved_config.get("qk_norm",     False),
         vit_pretrained = False,  # weights come from the checkpoint
     )
     model.load_state_dict(ck["model_state_dict"])
@@ -189,7 +190,8 @@ def main() -> None:
 
     # --- tokenizer ---
     from transformers import AutoTokenizer
-    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3.5-0.8B", trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(
+        saved_config.get("tokenizer", "Qwen/Qwen3.5-0.8B"), trust_remote_code=True)
 
     # --- preprocess + decode ---
     image_tensor = preprocess_image(args.image, img_size).to(device)

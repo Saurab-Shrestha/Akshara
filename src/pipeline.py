@@ -57,7 +57,7 @@ class AksharaPipeline:
 
         model_keys = ("img_size", "patch_size", "vision_dim", "vit_layers", "vit_heads",
                       "vocab_size", "n_embed", "n_heads", "n_kv_heads", "n_layers",
-                      "max_seq_len", "attn_every")
+                      "max_seq_len", "attn_every", "qk_norm")
         # vit_pretrained=False: weights come from the checkpoint — no need to
         # download DINOv2 just to overwrite it
         self.model = Akshara(**{k: cfg[k] for k in model_keys if k in cfg},
@@ -67,7 +67,7 @@ class AksharaPipeline:
         self.img_size = cfg.get("img_size", 448)
 
         from transformers import AutoTokenizer
-        self.tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3.5-0.8B")
+        self.tokenizer = AutoTokenizer.from_pretrained(cfg.get("tokenizer", "Qwen/Qwen3.5-0.8B"))
 
         self._layout    = None  # lazy — loaded on first .process()
         self._table_rec = None

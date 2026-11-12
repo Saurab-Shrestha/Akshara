@@ -1,5 +1,11 @@
 # Tokenization — Splitting Text into Numbers
 
+> **v2 note:** Akshara no longer uses the Qwen3.5 tokenizer. It trains its own
+> 32k byte-level BPE, because Qwen gets only 1.46 chars/token on Devanagari
+> (ours: 3.52) and its 248k vocab dominated a small model's parameters and
+> compute. The BPE concepts below still apply. See [02_tokenizer.md](../02_tokenizer.md).
+
+
 Before a model can read text, it must convert characters into numbers. That
 process is tokenization.
 

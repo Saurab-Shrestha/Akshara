@@ -32,10 +32,13 @@ def load(ckpt_path, device):
         n_kv_heads=c["n_kv_heads"], n_layers=c["n_layers"],
         max_seq_len=c["max_seq_len"], attn_every=c["attn_every"],
         use_fla=c.get("use_fla", False),
+        qk_norm=c.get("qk_norm", False),
     )
     model.load_state_dict(ck["model_state_dict"])
     model.to(device).eval()
-    return model, c["max_seq_len"], ck.get("step")
+    # v1 checkpoints predate the "tokenizer" field → Qwen
+    tok = AutoTokenizer.from_pretrained(c.get("tokenizer", "Qwen/Qwen3.5-0.8B"), trust_remote_code=True)
+    return model, tok, c["max_seq_len"], ck.get("step")
 
 
 @torch.no_grad()
@@ -64,8 +67,7 @@ def main():
     ap.add_argument("--max_new", type=int, default=50)
     a = ap.parse_args()
 
-    tok = AutoTokenizer.from_pretrained("Qwen/Qwen3.5-0.8B", trust_remote_code=True)
-    model, max_seq_len, step = load(a.ckpt, a.device)
+    model, tok, max_seq_len, step = load(a.ckpt, a.device)
     print(f"[lm_sample] loaded {a.ckpt} (step {step}) | device={a.device}\n")
     for p in PROMPTS:
         out = generate(model, tok, p, a.device, max_seq_len,

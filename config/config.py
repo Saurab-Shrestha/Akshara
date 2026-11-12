@@ -35,10 +35,15 @@ class ModelConfig:
     These must stay identical across all stages because loading a pretrained
     checkpoint into a fine-tuning run requires the same model topology.
 
-    DECODER (HybridDecoder, ~308M params):
-        - n_embed=768, n_heads=12, n_kv_heads=3 (GQA 4:1 compression)
-        - n_layers=16, attn_every=4  → 12 GDN blocks + 4 attention blocks (3:1 ratio)
-        - max_seq_len=512  (fits a full A4 page of dense Nepali text)
+    DECODER v2 (HybridDecoder, ~427M params — set in configs/base.json):
+        - own 32k byte-level BPE tokenizer (tokenizer/akshara-bpe) → 34M embedding
+        - n_embed=1024, n_heads=16, n_kv_heads=4 (GQA 4:1 compression)
+        - n_layers=32, attn_every=4  → 24 GDN blocks + 8 attention blocks (3:1 ratio)
+        - qk_norm=True, max_seq_len=1024
+
+    The dataclass defaults below are the v1 values (Qwen 248k vocab, 16 layers,
+    no QK-norm) so v1 checkpoints — whose saved config predates the new fields —
+    still rebuild correctly.
 
     VISION ENCODER (DINOv2-S/14, pretrained, ~22M params):
         - img_size=448, patch_size=14 → 32×32=1024 patch tokens
@@ -49,13 +54,15 @@ class ModelConfig:
     """
 
     # Decoder / tokenizer
-    vocab_size: int = 248077          # Qwen/Qwen3.5-0.8B: 248044 base + 33 special tokens
+    vocab_size: int = 248077          # v1: Qwen/Qwen3.5-0.8B. v2: 32768 (own BPE)
+    tokenizer: str = "Qwen/Qwen3.5-0.8B"  # HF id or local dir; v2: tokenizer/akshara-bpe
     n_embed: int = 768                # model dimension (residual stream width)
     n_heads: int = 12                 # number of query heads
     n_kv_heads: int = 3               # GQA: 12/3=4 queries share each KV head
     n_layers: int = 16                # total decoder layers
     max_seq_len: int = 512            # text tokens per crop (a dense paragraph fits)
     attn_every: int = 4               # full attention every N layers; others use GDN
+    qk_norm: bool = False             # v2: RMS-normalise Q/K per head in attention
 
     # Vision encoder (DINOv2-S/14, pretrained)
     img_size: int = 448               # crop canvas size (aspect-preserving pad)
@@ -118,6 +125,7 @@ class PretrainConfig(ModelConfig):
     lr: float = 3e-4
     min_lr: float = 3e-5
     weight_decay: float = 0.1
+    optimizer: str = "adamw"          # "muon" (v2): Muon on hidden matrices, AdamW on the rest
     grad_clip: float = 1.0
 
     # Checkpointing
@@ -140,7 +148,7 @@ class PretrainConfig(ModelConfig):
     # Durable backup: if set (e.g. "username/akshara-pretrain"), every saved
     # checkpoint is also uploaded to this HF Hub repo. Survives the training
     # machine dying. Requires `huggingface-cli login` on the box first.
-    hf_repo: Optional[str] = "Saurab0/akshara-pretrain"  # case-sensitive namespace!
+    hf_repo: Optional[str] = None   # set per run config, e.g. "Saurab0/akshara-pretrain-v2" (case-sensitive!)
 
 
 # ---------------------------------------------------------------------------
@@ -194,6 +202,7 @@ class OCRFinetuneConfig(ModelConfig):
     lr: float = 1e-4
     min_lr: float = 1e-5
     weight_decay: float = 0.05
+    optimizer: str = "adamw"          # "muon": match the optimizer the decoder was pretrained with
     grad_clip: float = 1.0
 
     # Checkpoint warm-start from pretrained decoder

@@ -9,12 +9,12 @@ WHY pretrain before OCR fine-tuning:
     *which* characters appear in the image.  Without this stage the model must
     simultaneously learn language and vision, which is harder and slower.
 
-TRAINING RECIPE:
-    - Cosine LR schedule with linear warmup (standard for transformers).
-    - Gradient accumulation to simulate a larger effective batch on T4 15GB.
-    - fp32 (T4 sm_75 doesn't support bf16 natively; fp16 would need GradScaler).
-    - FLA (Flash Linear Attention) kernels for GDN speed (~2,000 tok/s).
-    - Periodic eval (perplexity) and checkpoint saving.
+TRAINING RECIPE (v2):
+    - Own 32k BPE tokenizer (cfg.tokenizer) + packed uint16 .bin shards.
+    - Muon on hidden matrices + AdamW on embeddings/norms (cfg.optimizer).
+    - Cosine LR schedule with linear warmup.
+    - bf16 autocast on A100; FLA Triton kernel for GDN.
+    - Periodic eval (perplexity), checkpoint saving, HF Hub backup.
 
 CHECKPOINT FORMAT:
     {
@@ -51,6 +51,7 @@ from config.config import PretrainConfig
 from config.loader import load_config
 from src.data.text_dataset import get_text_dataloader
 from src.models.hybrid_decoder import HybridDecoder
+from src.optim import build_optimizer
 
 
 # ---------------------------------------------------------------------------
@@ -181,6 +182,7 @@ def main() -> None:
                         help="HF Hub repo (e.g. user/akshara-pretrain) to back up checkpoints to")
     parser.add_argument("--seed",        type=int,   default=None)
     parser.add_argument("--device",      type=str,   default=None)
+    parser.add_argument("--tokenizer",   type=str,   default=None)
     args = parser.parse_args()
 
     overrides = {k: v for k, v in vars(args).items()
@@ -201,7 +203,9 @@ def main() -> None:
     # Lazy import so the project works without transformers installed (e.g. for
     # config / data tests).
     from transformers import AutoTokenizer
-    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3.5-0.8B", trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(cfg.tokenizer, trust_remote_code=True)
+    assert len(tokenizer) <= cfg.vocab_size, \
+        f"tokenizer {cfg.tokenizer} has {len(tokenizer)} tokens > vocab_size {cfg.vocab_size}"
 
     # --- model ---
     model = HybridDecoder(
@@ -213,6 +217,7 @@ def main() -> None:
         max_seq_len=cfg.max_seq_len,
         attn_every=cfg.attn_every,
         use_fla=cfg.use_fla,
+        qk_norm=cfg.qk_norm,
     )
     if cfg.use_gradient_checkpointing:
         model.set_gradient_checkpointing(True)
@@ -236,12 +241,7 @@ def main() -> None:
         print(f"[pretrain] resumed from {args.resume} at step {start_step}")
 
     # --- optimizer: build before DataParallel (references same param tensors) ---
-    decay_params   = [p for n, p in model.named_parameters() if p.requires_grad and p.dim() >= 2]
-    nodecay_params = [p for n, p in model.named_parameters() if p.requires_grad and p.dim() < 2]
-    optimizer = torch.optim.AdamW([
-        {"params": decay_params,   "weight_decay": cfg.weight_decay},
-        {"params": nodecay_params, "weight_decay": 0.0},
-    ], lr=cfg.lr, betas=(0.9, 0.95), fused=(device == "cuda"))
+    optimizer = build_optimizer(model, cfg, device)
 
     if args.resume and os.path.exists(args.resume):
         ck = torch.load(args.resume, map_location="cpu", weights_only=False)

@@ -22,6 +22,14 @@ TOKENIZER:
     No padding is needed for the DataLoader because we drop the last incomplete
     batch and all samples are the same length after truncation.
 
+PACKED .bin (v2 — use this for real pretraining):
+    scripts/tokenize_corpus.py turns JSONL into one flat uint16 array of
+    <|bos|> doc <|eos|> <|bos|> doc <|eos|> …  PackedTokenDataset slices it
+    into non-overlapping windows of max_seq_len+1 tokens via np.memmap:
+    no padding, no RAM, no per-step tokenization. Windows cross document
+    boundaries (nanoGPT-style) — the BOS/EOS markers tell the model where a
+    new document starts. get_text_dataloader picks it for any ".bin" path.
+
 USAGE:
     PYTHONPATH=. python src/data/text_dataset.py
 """
@@ -31,8 +39,26 @@ from __future__ import annotations
 import json
 from typing import Optional
 
+import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
+
+
+class PackedTokenDataset(Dataset):
+    """Fixed windows over a flat uint16 token file (see scripts/tokenize_corpus.py)."""
+
+    def __init__(self, path: str, max_seq_len: int = 512):
+        self.tokens = np.memmap(path, dtype=np.uint16, mode="r")
+        self.L = max_seq_len
+
+    def __len__(self) -> int:
+        return (len(self.tokens) - 1) // self.L
+
+    def __getitem__(self, idx: int):
+        chunk = torch.from_numpy(
+            self.tokens[idx * self.L : idx * self.L + self.L + 1].astype(np.int64)
+        )
+        return chunk[:-1], chunk[1:]
 
 
 class TextDataset(Dataset):
@@ -120,7 +146,10 @@ def get_text_dataloader(
         A DataLoader that yields (input_ids, targets) batches of shape
         [batch_size, max_seq_len].
     """
-    dataset = TextDataset(path, tokenizer, max_seq_len=max_seq_len)
+    if path.endswith(".bin"):
+        dataset = PackedTokenDataset(path, max_seq_len=max_seq_len)
+    else:
+        dataset = TextDataset(path, tokenizer, max_seq_len=max_seq_len)
     return DataLoader(
         dataset,
         batch_size=batch_size,
@@ -168,6 +197,13 @@ if __name__ == "__main__":
         assert tgt.shape == (32,), f"expected (32,), got {tgt.shape}"
         # targets should be input shifted by 1
         assert torch.equal(inp[1:], tgt[:-1]) or True, "shift check — may differ at padding boundary"
+        # Packed .bin: windows are contiguous and targets = inputs shifted by 1
+        bin_path = tmp_path + ".bin"
+        np.arange(1000, dtype=np.uint16).tofile(bin_path)
+        pk = PackedTokenDataset(bin_path, max_seq_len=32)
+        x, y = pk[3]
+        assert len(pk) == 999 // 32 and x[0] == 96 and torch.equal(x[1:], y[:-1]) and y[-1] == 128
+        os.unlink(bin_path)
         print("Self-check PASSED.")
     finally:
         os.unlink(tmp_path)

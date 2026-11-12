@@ -112,6 +112,30 @@ with `-inf` → softmax output is 0 for all future positions.
 
 ---
 
+## v2: QK-norm + the fused kernel
+
+The manual version above (scores matrix + stored `causal_mask` buffer) is how
+attention *works*. v2's `attention.py` keeps it as `_reference_attention` and
+trains with the fused kernel instead:
+
+```python
+q, k = self.q_norm(q), self.k_norm(k)          # QK-norm: RMSNorm per head
+q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
+out = F.scaled_dot_product_attention(
+    q, k, v, is_causal=True, enable_gqa=self.n_rep > 1)
+```
+
+- **QK-norm.** If Q·K grows without bound, softmax saturates and the loss
+  spikes. Normalising Q and K per head bounds the logits. Qwen3, OLMo-2 and
+  Gemma-3 all do this.
+- **SDPA.** Same math, one FlashAttention kernel. It never materialises the
+  T×T score matrix, so there's no mask buffer, and `enable_gqa` shares KV heads
+  without `repeat_interleave` copies.
+- The self-check asserts SDPA matches `_reference_attention`, and that v1
+  checkpoints (which saved `causal_mask`) still load.
+
+---
+
 ## Verification
 
 ```

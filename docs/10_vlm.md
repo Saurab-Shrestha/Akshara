@@ -1,5 +1,10 @@
 # 10 · Full VLM Assembly
 
+> **v2 note:** shapes below use the old 12-layer / 248k-vocab decoder. In v2 the
+> decoder is 32 × 1024 with a 32k vocab, so logits are `(B, T, 32768)` and the
+> connector projects 384 → 1024. Assembly is unchanged.
+
+
 Wiring the three components into a single end-to-end OCR model.
 
 **File:** [`src/models/vlm.py`](../src/models/vlm.py)
