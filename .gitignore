@@ -60,3 +60,6 @@ __notebook__.ipynb
 # Misc
 *.tmp
 *.bak
+
+# Hand-collected minority-language text (see scripts/prepare_data.py)
+data/extra_langs/

@@ -82,6 +82,30 @@ characters, not documents (one Wikipedia article ≠ one forum post).
 Validation = 1 doc in 200, chosen by a CRC32 hash of the text (deterministic,
 spans every source).
 
+**Languages of Nepal (on top of the budget).** All available FineWeb-2 and
+Wikipedia text is taken, then repeated 4× in reshuffled passes (Muennighoff
+et al. 2023: ~4 epochs of repeated data is nearly as good as fresh data).
+Sizes below are FineWeb-2 compressed parquet:
+
+| Language | Script | FineWeb-2 | + Wikipedia |
+|---|---|---|---|
+| Maithili `mai` | Devanagari | 48 MB | ✓ |
+| Newari / Nepal Bhasa `new` | Devanagari | 30 MB | ✓ |
+| Bhojpuri `bho` | Devanagari | 26 MB | ✓ (`bh`) |
+| Awadhi `awa` | Devanagari | 3 MB | ✓ |
+| Santali `sat` | Ol Chiki | 3 MB | ✓ |
+| Tharu `thl`, Tamang `taj`, Sherpa `xsr`, Sunwar `suz`, Doteli `dty` | Devanagari | ≤1 MB each | Doteli ✓ |
+| Limbu `lif` | Devanagari + **Limbu script** | 0.5 + 0.2 MB | — |
+| Rai languages (Bantawa, Chamling, …), Magar | — | **none** | — |
+
+Every row carries a `lang` tag. Rai, Magar and most Limbu text have to be
+collected by hand: FLORES-200, Bible translations (check licenses), community
+and government sources. Add them as extra `MINORITY` entries before the
+tokenizer is trained, because the tokenizer is frozen once pretraining starts.
+
+Data provenance, filters, audit and licensing are tracked in
+**[DATASHEET.md](DATASHEET.md)**, which is the basis for the dataset card and paper.
+
 ```bash
 PYTHONPATH=. python scripts/prepare_data.py --total_chars 12e9 --out_dir data/corpus_v5
 ```

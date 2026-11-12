@@ -29,8 +29,10 @@ USAGE
         --input data/corpus_v5/train.jsonl --vocab_size 32768 \\
         --out_dir tokenizer/akshara-bpe --compare Qwen/Qwen3.5-0.8B
 
-Prints chars/token per script on held-out docs (higher = better compression)
-and asserts decode(encode(x)) == NFC(x).
+Prints chars/token per language on held-out docs (higher = better
+compression) and asserts decode(encode(x)) == NFC(x). Minority languages of
+Nepal (Maithili, Newari, Limbu, …) are oversampled `--boost`× in the
+training sample so BPE learns merges for them.
 """
 
 from __future__ import annotations
@@ -42,6 +44,10 @@ import random
 import unicodedata
 
 from tokenizers import Regex, Tokenizer, decoders, models, normalizers, pre_tokenizers, trainers
+
+from scripts.prepare_data import MINORITY
+
+MINORITY_LANGS = {m[3] for m in MINORITY}
 
 SPECIAL_TOKENS = [
     "<|bos|>", "<|eos|>", "<|pad|>",
@@ -68,18 +74,24 @@ def build_tokenizer() -> Tokenizer:
     return tok
 
 
-def iter_texts(path: str, sample_bytes: int, seed: int):
-    """Yield a uniform random sample of ~sample_bytes from a JSONL corpus.
+def iter_texts(path: str, sample_bytes: int, seed: int, boost: float, counts: dict):
+    """Yield a random sample of ~sample_bytes from a JSONL corpus.
 
     prepare_data.py writes sources one after another (Nepali, then Hindi, …),
-    so taking the first N lines would train an all-Nepali tokenizer.
+    so taking the first N lines would train an all-Nepali tokenizer. Rows
+    tagged with a minority language are kept `boost`× more often: BPE only
+    learns merges for text it sees, and Maithili/Limbu/… are <1% of the corpus.
     """
     keep = min(1.0, sample_bytes / max(1, os.path.getsize(path)))
     rng = random.Random(seed)
     with open(path, encoding="utf-8") as f:
         for line in f:
-            if rng.random() < keep:
-                yield json.loads(line)["text"]
+            row = json.loads(line)
+            lang = row.get("lang") or script_of(row["text"])
+            p = keep * boost if lang in MINORITY_LANGS else keep
+            if rng.random() < p:
+                counts[lang] = counts.get(lang, 0) + len(row["text"])
+                yield row["text"]
 
 
 def script_of(text: str) -> str:
@@ -88,15 +100,21 @@ def script_of(text: str) -> str:
     return "devanagari" if deva >= latin else "latin"
 
 
-def compression_report(encode, texts, label):
-    chars = {"devanagari": 0, "latin": 0}
-    toks = {"devanagari": 0, "latin": 0}
-    for t in texts:
-        s = script_of(t)
-        chars[s] += len(t)
-        toks[s] += len(encode(t))
-    row = " | ".join(f"{s}: {chars[s] / max(1, toks[s]):.2f}" for s in chars)
-    print(f"  {label:<28} chars/token  {row}")
+def load_eval(path: str, per_lang: int = 300) -> dict[str, list[str]]:
+    """Up to `per_lang` held-out docs for every language tag in the file."""
+    by_lang: dict[str, list[str]] = {}
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            row = json.loads(line)
+            lang = row.get("lang") or script_of(row["text"])
+            docs = by_lang.setdefault(lang, [])
+            if len(docs) < per_lang:
+                docs.append(row["text"])
+    return by_lang
+
+
+def chars_per_token(encode, texts) -> float:
+    return sum(len(t) for t in texts) / max(1, sum(len(encode(t)) for t in texts))
 
 
 def main():
@@ -107,6 +125,7 @@ def main():
     ap.add_argument("--sample_bytes", type=float, default=2e9, help="training sample size (bytes of JSONL)")
     ap.add_argument("--out_dir", default="tokenizer/akshara-bpe")
     ap.add_argument("--compare", default=None, help="HF tokenizer to compare against, e.g. Qwen/Qwen3.5-0.8B")
+    ap.add_argument("--boost", type=float, default=5.0, help="oversampling factor for minority languages")
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
 
@@ -122,7 +141,12 @@ def main():
         show_progress=True,
     )
     print(f"[tokenizer] training {args.vocab_size:,}-vocab BPE on ~{args.sample_bytes/1e9:.1f} GB of {args.input}")
-    tok.train_from_iterator(iter_texts(args.input, int(args.sample_bytes), args.seed), trainer=trainer)
+    counts: dict[str, int] = {}
+    tok.train_from_iterator(
+        iter_texts(args.input, int(args.sample_bytes), args.seed, args.boost, counts), trainer=trainer)
+    total = sum(counts.values())
+    print("[tokenizer] training sample by language: " + ", ".join(
+        f"{l} {c/total:.1%}" for l, c in sorted(counts.items(), key=lambda x: -x[1])))
 
     from transformers import PreTrainedTokenizerFast
     hf_tok = PreTrainedTokenizerFast(
@@ -138,20 +162,29 @@ def main():
     if not os.path.exists(eval_path):
         print(f"[tokenizer] no eval file at {eval_path}; skipping report")
         return
-    with open(eval_path, encoding="utf-8") as f:
-        texts = [json.loads(l)["text"] for _, l in zip(range(2000), f)]
+    by_lang = load_eval(eval_path)
 
-    for t in texts[:500]:
-        ids = hf_tok.encode(t, add_special_tokens=False)
-        assert hf_tok.decode(ids) == unicodedata.normalize("NFC", t), "round-trip failed"
+    for texts in by_lang.values():
+        for t in texts[:50]:
+            ids = hf_tok.encode(t, add_special_tokens=False)
+            assert hf_tok.decode(ids) == unicodedata.normalize("NFC", t), "round-trip failed"
     print("[tokenizer] round-trip decode(encode(x)) == NFC(x) ✅")
 
-    print("[tokenizer] compression on held-out docs (higher is better):")
-    compression_report(lambda t: hf_tok.encode(t, add_special_tokens=False), texts, f"akshara-bpe {len(hf_tok)//1000}k")
+    ours = lambda t: hf_tok.encode(t, add_special_tokens=False)
+    ref = None
     if args.compare:
         from transformers import AutoTokenizer
-        ref = AutoTokenizer.from_pretrained(args.compare)
-        compression_report(lambda t: ref.encode(t, add_special_tokens=False), texts, f"{args.compare} {len(ref)//1000}k")
+        ref_tok = AutoTokenizer.from_pretrained(args.compare)
+        ref = lambda t: ref_tok.encode(t, add_special_tokens=False)
+
+    print(f"[tokenizer] chars/token on held-out docs (higher is better)")
+    print(f"  {'lang':<6} {'docs':>5}  {'ours ' + str(len(hf_tok)//1024) + 'k':>9}" + (f"  {args.compare:>20}" if ref else ""))
+    for lang in sorted(by_lang, key=lambda l: (l in MINORITY_LANGS, l)):
+        texts = by_lang[lang]
+        line = f"  {lang:<6} {len(texts):>5}  {chars_per_token(ours, texts):>9.2f}"
+        if ref:
+            line += f"  {chars_per_token(ref, texts):>20.2f}"
+        print(line)
 
 
 if __name__ == "__main__":
