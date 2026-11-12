@@ -96,8 +96,17 @@ MINORITY = [
     ("wiki/dty",          "wiki",     "20231101.dty", "dty"),
     ("wiki/sat",          "wiki",     "20231101.sat", "sat"),
 ]
-MINORITY_REPEATS = 4
+MINORITY_REPEATS = 4            # max repeats for the smallest languages
+MINORITY_TARGET_CHARS = 200e6   # repeat a language until ~this many chars, capped above
 BIBLE_SOURCES = ("bible", "door43")
+
+
+def lang_repeats(per_lang_chars: dict[str, int]) -> dict[str, int]:
+    """Repeat small languages up to MINORITY_REPEATS×, big ones (Maithili, Newari,
+    Bhojpuri: 300M+ chars) not at all — otherwise 4× repeats would make the
+    minority pool ~30% of the corpus."""
+    return {l: max(1, min(MINORITY_REPEATS, round(MINORITY_TARGET_CHARS / max(1, c))))
+            for l, c in per_lang_chars.items()}
 
 
 def stream_texts(kind: str, arg: str | None, quality: int):
@@ -186,7 +195,9 @@ def train_only(license: str | None) -> bool:
     if not license:
         return True
     lic = license.upper()
-    return any(k in lic for k in ("NC", "NON-COMMERCIAL", "REDISTRIBUTABLE=FALSE", "UNCLEAR", "NONE STATED"))
+    # "other" / "per-subsource" = aggregates whose parts carry their own licenses
+    return any(k in lic for k in ("NC", "NON-COMMERCIAL", "REDISTRIBUTABLE=FALSE", "UNCLEAR",
+                                  "NONE STATED", "OTHER", "PER-SUBSOURCE"))
 
 
 def _row(text: str, lang: str, train_only: bool = False) -> str:
@@ -223,13 +234,17 @@ def prepare_corpus(total_chars: float, out_dir: str, quality: int,
             stats[label] = (docs, got)
 
         # Minority languages: take everything, write val once, then write the
-        # train docs MINORITY_REPEATS times — each pass reshuffled, so copies of
-        # one doc sit ~a whole pass apart and never share a training window.
+        # train docs in reshuffled passes, so copies of one doc sit ~a whole
+        # pass apart and never share a training window. Repeats are sized per
+        # language (lang_repeats): small languages up to 4×, big ones 1×.
+        # ponytail: whole minority pool held in RAM (~2B chars ≈ 5 GB); switch to
+        # an on-disk shuffle if it outgrows the box.
         if minority:
-            pool: list[tuple[str, str, int, bool]] = []   # (text, lang, repeats, train_only)
-            seen: set[bytes] = set()                 # exact dedupe across sources
+            pool: list[tuple[str, str, bool, bool]] = []   # (text, lang, bible, train_only)
+            seen: set[bytes] = set()                       # exact dedupe across sources
+            sources: dict[str, tuple[str, int, int]] = {}  # label -> (lang, docs, chars)
 
-            def add(label, texts, lang, repeats, nc=False):
+            def add(label, texts, lang, bible=False, nc=False):
                 got = docs = 0
                 try:
                     for text in texts:
@@ -240,29 +255,39 @@ def prepare_corpus(total_chars: float, out_dir: str, quality: int,
                         if is_val(text):
                             fva.write(_row(text, lang, nc))
                         else:
-                            pool.append((text, lang, repeats, nc))
+                            pool.append((text, lang, bible, nc))
                         got += len(text)
                         docs += 1
                 except Exception as e:
                     print(f"    [warn] {label} failed after {docs:,} docs: {e}")
-                print(f"[{label}] took all: {docs:,} docs, {got/1e6:,.1f}M chars (×{repeats})"
-                      + (" [train-only]" if nc else ""))
-                stats[label] = (docs * repeats, got * repeats)
+                print(f"[{label}] {lang}: {docs:,} docs, {got/1e6:,.1f}M chars"
+                      + (" [bible 1×]" if bible else "") + (" [train-only]" if nc else ""))
+                sources[label] = (lang, docs, got, bible)
 
             for label, kind, arg, lang in MINORITY:
                 script = expected_script(arg)
                 texts = (t for t in stream_texts(kind, arg, quality) if script_ok(t, script))
-                add(label, texts, lang, MINORITY_REPEATS)
+                add(label, texts, lang)
             for path, lang, source, nc, texts in iter_extra(extra_dir):
-                # Bible-derived text (eBible, door43 Open Bible Stories) is one
-                # narrow register — don't let it dominate
-                repeats = 1 if any(b in source.lower() for b in BIBLE_SOURCES) else MINORITY_REPEATS
-                add(f"extra/{os.path.basename(path)}", texts, lang, repeats, nc)
+                # Bible-derived text (eBible, door43) is one narrow register: kept 1×
+                bible = any(b in source.lower() for b in BIBLE_SOURCES)
+                add(f"extra/{os.path.basename(path)}", texts, lang, bible, nc)
+
+            per_lang: dict[str, int] = {}
+            for lang, _, chars, _ in sources.values():
+                per_lang[lang] = per_lang.get(lang, 0) + chars
+            reps = lang_repeats(per_lang)
+            print("[minority] repeats per language: " + ", ".join(
+                f"{l} {per_lang[l]/1e6:.0f}M×{reps[l]}" for l in sorted(per_lang, key=lambda l: -per_lang[l])))
+            for label, (lang, docs, chars, bible) in sources.items():
+                r = 1 if bible else reps[lang]
+                stats[label] = (docs * r, chars * r)
 
             rng = random.Random(seed)
             for k in range(MINORITY_REPEATS):
                 rng.shuffle(pool)
-                ftr.writelines(_row(t, l, nc) for t, l, r, nc in pool if k < r)
+                ftr.writelines(_row(t, l, nc) for t, l, b, nc in pool
+                               if k < (1 if b else reps[l]))
 
     total = sum(c for _, c in stats.values())
     print(f"\n[data] {total/1e9:.2f}B chars (≈{total/3.5/1e9:.2f}B tokens) → {out_dir}/")
@@ -291,6 +316,9 @@ if __name__ == "__main__":
         assert expected_script("20231101.sat") == "Olck" and expected_script("20231101.new") == "Deva"
         assert train_only("CC BY-NC-ND 3.0") and train_only("CC BY-NC 4.0") and train_only(None)
         assert not train_only("CC BY-SA 4.0") and not train_only("CC0") and not train_only("CC BY 2.0 FR")
+        assert train_only("other (per-subsource licenses)") and train_only("odc-by (per-subsource licenses)")
+        assert not train_only("odc-by") and not train_only("cc0-1.0 (CC ToU)")
+        assert lang_repeats({"mai": 400e6, "sat": 130e6, "awa": 65e6, "lif": 3e6}) == {"mai": 1, "sat": 2, "awa": 3, "lif": 4}
         print("prepare_data selftest passed")
     else:
         main()
