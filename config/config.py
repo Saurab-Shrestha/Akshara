@@ -35,8 +35,8 @@ class ModelConfig:
     These must stay identical across all stages because loading a pretrained
     checkpoint into a fine-tuning run requires the same model topology.
 
-    DECODER v2 (HybridDecoder, ~427M params — set in configs/base.json):
-        - own 32k byte-level BPE tokenizer (tokenizer/akshara-bpe) → 34M embedding
+    DECODER v2 (HybridDecoder, ~443M params — set in configs/base.json):
+        - own 48k byte-level BPE tokenizer (tokenizer/akshara-bpe) → 50M embedding
         - n_embed=1024, n_heads=16, n_kv_heads=4 (GQA 4:1 compression)
         - n_layers=32, attn_every=4  → 24 GDN blocks + 8 attention blocks (3:1 ratio)
         - qk_norm=True, max_seq_len=1024
@@ -54,7 +54,7 @@ class ModelConfig:
     """
 
     # Decoder / tokenizer
-    vocab_size: int = 248077          # v1: Qwen/Qwen3.5-0.8B. v2: 32768 (own BPE)
+    vocab_size: int = 248077          # v1: Qwen/Qwen3.5-0.8B. v2: 49152 (own BPE)
     tokenizer: str = "Qwen/Qwen3.5-0.8B"  # HF id or local dir; v2: tokenizer/akshara-bpe
     n_embed: int = 768                # model dimension (residual stream width)
     n_heads: int = 12                 # number of query heads

@@ -10,12 +10,12 @@ v1 used the **Qwen3.5-0.8B** tokenizer (248k tokens). The reasoning made sense
 at the time: a huge multilingual tokenizer had already solved coverage. Then
 we measured what it cost a ~110M-param model:
 
-| | Qwen3.5 248k | **akshara-bpe 32k** |
+| | Qwen3.5 248k | **akshara-bpe 48k** |
 |---|---|---|
-| Devanagari chars/token (held-out) | 1.46 | **3.52** |
-| Latin chars/token | 4.22 | 4.05 |
-| Embedding params (dim 1024) | 254M | **34M** |
-| Output-head FLOPs/token (fwd+bwd) | ~1.5 GFLOP | ~0.2 GFLOP |
+| Nepali chars/token (held-out) | 1.44 | **4.60** |
+| English chars/token | 4.32 | 4.08 |
+| Embedding params (dim 1024) | 254M | **50M** |
+| Output-head FLOPs/token (fwd+bwd) | ~1.5 GFLOP | ~0.3 GFLOP |
 
 Qwen's vocabulary is spread across ~100 languages. Only a small slice of it
 is Devanagari, so Nepali is split into short pieces and every sentence costs
@@ -23,8 +23,24 @@ is Devanagari, so Nepali is split into short pieces and every sentence costs
 of the parameters and most of the compute. A tokenizer trained on *our*
 languages fixes both, and building it is a lesson in its own right.
 
-(Numbers measured with a tokenizer trained on a 100 MB sample of the v1 corpus.
-Re-check them on the full v2 corpus.)
+### 32k vs 48k (2026-11-12, preliminary test corpus)
+
+| Lang | 32k | **48k** | Qwen 248k |
+|---|---|---|---|
+| English | 3.87 | **4.08** | 4.32 |
+| Nepali | 4.35 | **4.60** | 1.44 |
+| Hindi | 3.72 | **3.87** | 1.56 |
+| Maithili | 3.51 | **3.69** | 1.45 |
+| Bhojpuri | 3.49 | **3.67** | 1.54 |
+| Newari | 3.82 | **3.89** | 1.33 |
+| Santali (Ol Chiki) | 2.76 | **3.02** | 0.45 |
+| Tamang / Tharu / Sherpa / Sunwar | 2.4–2.9 | **2.7–3.2** | ~1.4 |
+
+48k wins on every language by 4–11%. It adds 17M embedding params (+4%)
+and ~4% compute per token, but needs ~5% fewer tokens for the same text, so
+the compute per character is about the same and the context holds more text.
+**v2 uses 48k (49,152).** These numbers come from a 200M-char test corpus that
+lacked the Newari fix and the hand-collected sources. Re-measure on the full corpus.
 
 ---
 
@@ -73,15 +89,15 @@ packed corpus on disk (`scripts/tokenize_corpus.py`).
 
 ```bash
 PYTHONPATH=. python scripts/train_tokenizer.py \
-    --input data/corpus_v5/train.jsonl --vocab_size 32768 \
+    --input data/corpus_v5/train.jsonl --vocab_size 49152 \
     --out_dir tokenizer/akshara-bpe --compare Qwen/Qwen3.5-0.8B
 ```
 
 - Trains on a uniform random ~2 GB sample. The corpus is written source by
   source, so taking the first N lines would give an all-Nepali tokenizer.
 - Asserts `decode(encode(x)) == NFC(x)` on 500 held-out docs.
-- Prints chars/token per script. If Latin compression lags, try
-  `--vocab_size 49152` or `65535` and compare.
+- Prints chars/token per language. Minority languages are sampled `--boost`×
+  (default 2). Check the printed "training sample by language" shares.
 - Commit `tokenizer/akshara-bpe/`. Every checkpoint depends on these exact ids.
 
 Sample output (100 MB training sample):

@@ -32,9 +32,9 @@ architecture upgrades that would otherwise have been wasted on a finished run.
 
 | | v1 | v2 |
 |---|---|---|
-| Tokenizer | Qwen3.5-0.8B, 248k | **own byte-level BPE, 32k** (`tokenizer/akshara-bpe`) |
+| Tokenizer | Qwen3.5-0.8B, 248k | **own byte-level BPE, 48k** (`tokenizer/akshara-bpe`) |
 | Decoder | 768 × 16 layers, 12 GDN + 4 attn | **1024 × 32 layers, 24 GDN + 8 attn** |
-| Params | 308M (190M embedding) | **427M (34M embedding, 393M body)** |
+| Params | 308M (190M embedding) | **443M (50M embedding, 393M body)** |
 | Context | 512 | **1024** |
 | Attention | hand-written softmax + stored mask | **QK-norm + fused SDPA (FlashAttention)** |
 | Optimizer | AdamW | **Muon (hidden matrices) + AdamW (rest)** |
@@ -109,8 +109,8 @@ Data provenance, filters, audit and licensing are tracked in
 ```bash
 PYTHONPATH=. python scripts/prepare_data.py --total_chars 12e9 --out_dir data/corpus_v5
 ```
-12e9 chars ≈ 3.4B tokens ≈ 30 GB of JSONL. For Chinchilla-optimal 427M
-(~8.5B tokens) use `--total_chars 30e9`.
+12e9 chars ≈ 3.4B tokens ≈ 30 GB of JSONL. For Chinchilla-optimal 443M
+(~8.9B tokens) use `--total_chars 30e9`.
 
 ### Stage 1 — Tokenizer (`scripts/train_tokenizer.py`)
 
@@ -121,11 +121,11 @@ them off). Special tokens reserved now: `<|bos|> <|eos|> <|pad|> <|image|>
 
 ```bash
 PYTHONPATH=. python scripts/train_tokenizer.py --input data/corpus_v5/train.jsonl \
-    --vocab_size 32768 --out_dir tokenizer/akshara-bpe --compare Qwen/Qwen3.5-0.8B
+    --vocab_size 49152 --out_dir tokenizer/akshara-bpe --compare Qwen/Qwen3.5-0.8B
 ```
-Measured on a 100 MB sample of the v1 corpus: **3.52 chars/token Devanagari,
-4.05 Latin** (Qwen: 1.46 / 4.22). Re-check on the full corpus; try 48k or 64k
-if Latin compression lags (anything ≤ 65,535 fits the uint16 shards). Commit
+**Vocab = 48k (49,152)**, chosen over 32k: 4–11% better chars/token on every
+language at about equal compute per character (comparison in
+[02_tokenizer.md](02_tokenizer.md)). Nepali 4.60 chars/token vs Qwen's 1.44. Commit
 the resulting `tokenizer/akshara-bpe/` — every later stage depends on it.
 
 ### Stage 2 — Pack (`scripts/tokenize_corpus.py`)
@@ -152,12 +152,12 @@ Recipe: Muon (`adjust_lr_fn="match_rms_adamw"`, so one lr drives both
 optimizers) lr 4e-4 → 4e-5 cosine, 1k warmup, wd 0.1, 98k tokens/step
 (8 × 1024 × 12), bf16 + FLA, 32.5k steps ≈ 3.2B tokens.
 
-**Compute — read before starting.** 427M params ≈ 6 × 427M = 2.6 GFLOP/token.
+**Compute — read before starting.** 443M params ≈ 6 × 443M = 2.7 GFLOP/token.
 
 | Tokens | FLOPs | at v1's measured efficiency (~36 TFLOP/s) | at 40% MFU (~125 TFLOP/s) |
 |---|---|---|---|
-| 3.2B (this config) | 8.2e18 | **~63 h** | ~18 h |
-| 8.5B (Chinchilla) | 2.2e19 | ~170 h | ~48 h |
+| 3.2B (this config) | 8.5e18 | **~66 h** | ~19 h |
+| 8.9B (Chinchilla) | 2.4e19 | ~180 h | ~52 h |
 
 v1 ran at roughly 12% MFU; the smaller vocab, fused attention, and
 `compile: true` should raise it, but **measure tok/s in the first 100 steps**
@@ -218,7 +218,7 @@ Eval: CER on heiDATA (held out, never trained), a small VQA set, and
 
 ## 5. Vision encoder — why it stays pretrained (22M)
 
-DINOv2-S/14 is 22M params: tiny next to the 427M decoder (LLaVA-style models
+DINOv2-S/14 is 22M params: tiny next to the 443M decoder (LLaVA-style models
 are typically 5–20% vision). Training a ViT from scratch needs hundreds of
 millions of images; we still build everything around it (patching, position
 interpolation, variable resolution, the connector). Upgrade path if the

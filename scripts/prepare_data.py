@@ -97,6 +97,7 @@ MINORITY = [
     ("wiki/sat",          "wiki",     "20231101.sat", "sat"),
 ]
 MINORITY_REPEATS = 4
+BIBLE_SOURCES = ("bible", "door43")
 
 
 def stream_texts(kind: str, arg: str | None, quality: int):
@@ -160,20 +161,39 @@ def iter_extra(extra_dir: str):
     one file per source+language — see data/extra_langs/MANIFEST_*.json."""
     if not extra_dir or not os.path.isdir(extra_dir):
         return
+    licenses = {}
+    for mf in glob.glob(os.path.join(extra_dir, "MANIFEST_*.json")):
+        with open(mf, encoding="utf-8") as f:
+            for e in json.load(f):
+                if e.get("file"):
+                    licenses[os.path.basename(e["file"])] = e.get("license") or ""
     for path in sorted(glob.glob(os.path.join(extra_dir, "*.jsonl"))):
         with open(path, encoding="utf-8") as f:
             first = json.loads(f.readline())
+        lic = licenses.get(os.path.basename(path))
         def texts(path=path):
             with open(path, encoding="utf-8") as f:
                 for line in f:
                     t = json.loads(line)["text"].strip()
                     if len(t) >= 20:
                         yield t
-        yield path, first["lang"], first.get("source", ""), texts()
+        yield path, first["lang"], first.get("source", ""), train_only(lic), texts()
 
 
-def _row(text: str, lang: str) -> str:
-    return json.dumps({"text": text, "lang": lang}, ensure_ascii=False) + "\n"
+def train_only(license: str | None) -> bool:
+    """Train on it, never publish it: non-commercial / no-derivatives / not
+    redistributable licenses, and anything without a known license."""
+    if not license:
+        return True
+    lic = license.upper()
+    return any(k in lic for k in ("NC", "NON-COMMERCIAL", "REDISTRIBUTABLE=FALSE", "UNCLEAR", "NONE STATED"))
+
+
+def _row(text: str, lang: str, train_only: bool = False) -> str:
+    row = {"text": text, "lang": lang}
+    if train_only:
+        row["train_only"] = True   # excluded from any public release of the corpus
+    return json.dumps(row, ensure_ascii=False) + "\n"
 
 
 def prepare_corpus(total_chars: float, out_dir: str, quality: int,
@@ -206,10 +226,10 @@ def prepare_corpus(total_chars: float, out_dir: str, quality: int,
         # train docs MINORITY_REPEATS times — each pass reshuffled, so copies of
         # one doc sit ~a whole pass apart and never share a training window.
         if minority:
-            pool: list[tuple[str, str, int]] = []   # (text, lang, repeats)
+            pool: list[tuple[str, str, int, bool]] = []   # (text, lang, repeats, train_only)
             seen: set[bytes] = set()                 # exact dedupe across sources
 
-            def add(label, texts, lang, repeats):
+            def add(label, texts, lang, repeats, nc=False):
                 got = docs = 0
                 try:
                     for text in texts:
@@ -218,29 +238,31 @@ def prepare_corpus(total_chars: float, out_dir: str, quality: int,
                             continue
                         seen.add(h)
                         if is_val(text):
-                            fva.write(_row(text, lang))
+                            fva.write(_row(text, lang, nc))
                         else:
-                            pool.append((text, lang, repeats))
+                            pool.append((text, lang, repeats, nc))
                         got += len(text)
                         docs += 1
                 except Exception as e:
                     print(f"    [warn] {label} failed after {docs:,} docs: {e}")
-                print(f"[{label}] took all: {docs:,} docs, {got/1e6:,.1f}M chars (×{repeats})")
+                print(f"[{label}] took all: {docs:,} docs, {got/1e6:,.1f}M chars (×{repeats})"
+                      + (" [train-only]" if nc else ""))
                 stats[label] = (docs * repeats, got * repeats)
 
             for label, kind, arg, lang in MINORITY:
                 script = expected_script(arg)
                 texts = (t for t in stream_texts(kind, arg, quality) if script_ok(t, script))
                 add(label, texts, lang, MINORITY_REPEATS)
-            for path, lang, source, texts in iter_extra(extra_dir):
-                # Bible text is one narrow register — don't let it dominate
-                repeats = 1 if "bible" in source.lower() else MINORITY_REPEATS
-                add(f"extra/{os.path.basename(path)}", texts, lang, repeats)
+            for path, lang, source, nc, texts in iter_extra(extra_dir):
+                # Bible-derived text (eBible, door43 Open Bible Stories) is one
+                # narrow register — don't let it dominate
+                repeats = 1 if any(b in source.lower() for b in BIBLE_SOURCES) else MINORITY_REPEATS
+                add(f"extra/{os.path.basename(path)}", texts, lang, repeats, nc)
 
             rng = random.Random(seed)
             for k in range(MINORITY_REPEATS):
                 rng.shuffle(pool)
-                ftr.writelines(_row(t, l) for t, l, r in pool if k < r)
+                ftr.writelines(_row(t, l, nc) for t, l, r, nc in pool if k < r)
 
     total = sum(c for _, c in stats.values())
     print(f"\n[data] {total/1e9:.2f}B chars (≈{total/3.5/1e9:.2f}B tokens) → {out_dir}/")
@@ -267,6 +289,8 @@ if __name__ == "__main__":
         assert script_ok("नेपाल भाषा", "Deva") and not script_ok("The Limbu Language Kit", "Limb")
         assert script_ok("ᤛᤡᤖᤡᤈᤨᤅ", "Limb") and expected_script("lif_Limb") == "Limb"
         assert expected_script("20231101.sat") == "Olck" and expected_script("20231101.new") == "Deva"
+        assert train_only("CC BY-NC-ND 3.0") and train_only("CC BY-NC 4.0") and train_only(None)
+        assert not train_only("CC BY-SA 4.0") and not train_only("CC0") and not train_only("CC BY 2.0 FR")
         print("prepare_data selftest passed")
     else:
         main()

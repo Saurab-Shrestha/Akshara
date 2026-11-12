@@ -4,8 +4,8 @@ A small multimodal LLM built from scratch. Its first job is Devanagari + English
 
 > **v2 update (2026-11):** the project grew from an OCR recognizer into
 > a from-scratch multimodal LLM. Plan and rationale:
-> **[ROADMAP_V2.md](ROADMAP_V2.md)**. What changed in this doc: own 32k
-> tokenizer (§2.5), 427M decoder with QK-norm + fused attention (§2.4), Muon,
+> **[ROADMAP_V2.md](ROADMAP_V2.md)**. What changed in this doc: own 48k
+> tokenizer (§2.5), 443M decoder with QK-norm + fused attention (§2.4), Muon,
 > packed-token pretraining (§3). The vision side, connector, crop pipeline
 > and OCR data strategy below are unchanged.
 
@@ -70,7 +70,7 @@ flowchart LR
     C --> D["visual prefix<br/>1024 × 1024"]
     D --> E["HybridDecoder v2<br/>32 layers, dim 1024<br/>GDN:attention 3:1"]
     T["text tokens so far"] --> E
-    E --> F["next-token logits<br/>vocab 32 768"]
+    E --> F["next-token logits<br/>vocab 49 152"]
 ```
 
 ### 2.1 Input preprocessing — aspect-preserving pad, never squash
@@ -112,7 +112,7 @@ initialized to 0.02**. Token embeddings have per-dim std 0.02; without this
 norm the visual prefix enters the residual stream ~5× hotter than text and
 drowns it out early in training.
 
-### 2.4 HybridDecoder v2 (~427 M params: 393 M body + 34 M embedding)
+### 2.4 HybridDecoder v2 (~443 M params: 393 M body + 50 M embedding)
 
 32 layers, width 1024, alternating **Gated DeltaNet (GDN)** and full
 attention 3:1 (`attn_every=4` → every 4th layer is attention). Deep-and-thin
@@ -150,7 +150,7 @@ v1 was 16 × 768 with a 190 M embedding (Qwen vocab), pinned in
   positions are "predict EOS given EOS" and the model learns to emit empty
   pages.
 
-### 2.5 Tokenizer — our own 32k byte-level BPE (v2)
+### 2.5 Tokenizer — our own 48k byte-level BPE (v2)
 
 `tokenizer/akshara-bpe`, trained by `scripts/train_tokenizer.py` on our own
 corpus: NFC normalisation, a pre-tokenizer split that keeps matras, virama
@@ -159,7 +159,7 @@ and ZWJ attached to their consonants, and digits grouped 1–3. Special tokens:
 `<|im_end|>`, plus 10 reserved, so stages 4–5 never resize the embedding.
 
 Why it replaced Qwen's 248k vocab: on Devanagari, Qwen gets 1.46 chars/token
-and ours gets 3.52, and the embedding drops from 190M to 34M params. Details:
+and ours gets 3.5–4.6 (48k: Nepali 4.60), and the embedding drops from 190M to 50M params. 48k beat 32k by 4–11% on every language at roughly equal compute per character. Details:
 [02_tokenizer.md](02_tokenizer.md). v1 checkpoints carry
 `tokenizer: Qwen/Qwen3.5-0.8B` in their config (default when absent).
 

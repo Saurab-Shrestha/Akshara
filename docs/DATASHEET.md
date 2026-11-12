@@ -101,7 +101,7 @@ contact details of private individuals. TODO: decide on PII filtering
    deterministic and spans every source.
 6. **Repetition.** Minority train docs are written 4× in reshuffled passes;
    Bible-derived text is kept 1×.
-7. **Tokenization** uses our 32k byte-level BPE (`scripts/train_tokenizer.py`), packed to uint16.
+7. **Tokenization** uses our 48k byte-level BPE (`scripts/train_tokenizer.py`), packed to uint16.
 
 **Known pitfalls found so far**
 - FineWeb-2 `new_Deva` has an extra column, so casting it to the declared schema
@@ -135,6 +135,15 @@ contains many bot-generated stub articles.
 ---
 
 ## 5. Distribution
+
+**Train-only data (decided 2026-11-12).** Rows from sources with
+non-commercial, no-derivatives, not-redistributable or unknown licenses carry
+`"train_only": true`. They're used for training and **never published** in the
+corpus. Today that covers eBible Limbu, Sunwar and Tamang (CC BY-NC-ND 3.0),
+NepTam Tamang (CC BY-NC 4.0), and any file missing from the manifests.
+The release script must drop these rows. Note: training on NC data may
+also restrict commercial use of the resulting model. Revisit before any
+commercial use.
 
 - **Where:** Hugging Face dataset repo (TODO: name), plus the rebuild scripts in this repo.
 - **License:** follows the most restrictive license in each subset: ODC-By for the FineWeb

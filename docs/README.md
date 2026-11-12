@@ -3,7 +3,7 @@
 A step-by-step, build-from-scratch tutorial for the model's components.
 
 > **v2 (2026-11): Akshara is now a from-scratch multimodal LLM.** Start with
-> **[ROADMAP_V2.md](ROADMAP_V2.md)**: own 32k tokenizer, 427M decoder, Muon,
+> **[ROADMAP_V2.md](ROADMAP_V2.md)**: own 48k tokenizer, 443M decoder, Muon,
 > QK-norm, 3B+ token pretrain, then vision alignment and instruction tuning.
 > Then read [ARCHITECTURE.md](ARCHITECTURE.md). Chapters 02 and 04 are updated
 > for v2; 07 and 10 carry v2 notes (their mechanics hold, their numbers are v1).
@@ -18,7 +18,7 @@ A step-by-step, build-from-scratch tutorial for the model's components.
 
 ## What we're building
 
-A **~450M parameter multimodal LLM** (427M decoder + 22M vision) that reads
+A **~466M parameter multimodal LLM** (443M decoder + 22M vision) that reads
 Devanagari + English documents and answers about images. The diagram shows the
 crop-reading path; numbers are v2:
 
@@ -40,7 +40,7 @@ Crop image (448×448)
             ▼
  ┌─────────────────────┐
  │  Hybrid Decoder     │  32 layers × 1024, 3:1 GDN + Attention (FLA on GPU),
- │  (~427M params)     │  own 32k vocab, QK-norm, generates text
+ │  (~443M params)     │  own 48k vocab, QK-norm, generates text
  └──────────┬──────────┘
             │
             ▼
@@ -84,7 +84,7 @@ documents), 25% are exact attention (ensures verbatim character recall for OCR).
 | Doc | What we build | Files |
 |---|---|---|
 | [01 · Setup](01_setup.md) | Project structure, venv, dependencies | `requirements.txt`, `tokenizer/verify.py` |
-| [02 · Tokenizer](02_tokenizer.md) | **v2:** training our own 32k byte-level BPE | `scripts/train_tokenizer.py` |
+| [02 · Tokenizer](02_tokenizer.md) | **v2:** training our own 48k byte-level BPE | `scripts/train_tokenizer.py` |
 | [03 · Building Blocks](03_building_blocks.md) | RMSNorm, RoPE, SwiGLU | `src/models/rms_norm.py`, `rope.py`, `swiglu.py` |
 | [04 · Attention](04_attention.md) | Multi-head attention + GQA + causal mask + **v2 QK-norm/SDPA** | `src/models/attention.py` |
 | [05 · Transformer Block](05_transformer_block.md) | One full standard layer | `src/models/transformer_block.py` |

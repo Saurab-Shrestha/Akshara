@@ -1,5 +1,5 @@
 {
-  "_comment": "v2 pretrain (427M decoder) on A100 40GB, bf16 + FLA. 8x1024x12 = 98k tokens/step x 32.5k steps ≈ 3.2B tokens (1 epoch of corpus_v5). Chinchilla-optimal for 427M is ~8.5B tokens — this first pass is deliberately under that; continue with a bigger corpus if budget allows. Spans many sessions: resume from the HF backup. OOM → lower batch_size, raise grad_accum (keep the product).",
+  "_comment": "v2 pretrain (443M decoder) on A100 40GB, bf16 + FLA. 8x1024x12 = 98k tokens/step x 32.5k steps ≈ 3.2B tokens (1 epoch of corpus_v5). Chinchilla-optimal for 443M is ~8.9B tokens — this first pass is deliberately under that; continue with a bigger corpus if budget allows. Spans many sessions: resume from the HF backup. OOM → lower batch_size, raise grad_accum (keep the product).",
   "device": "cuda",
   "batch_size": 8,
   "grad_accum": 12,

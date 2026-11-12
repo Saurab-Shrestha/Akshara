@@ -7,7 +7,7 @@ v1 borrowed Qwen3.5's 248k vocab. For a ~110M-param decoder that was the
 single biggest waste in the model:
     - embedding table 248k × 768 = 190M params — more than the whole body
     - output head ~380M FLOPs/token — more than all 16 layers combined
-A 32k vocab trained on *our* languages (ne/hi/mr/sa + en) cuts both by ~8×
+A 48k vocab trained on *our* languages (ne/hi/mr/sa + en) cuts both by ~5×
 and spends the compute on the layers that actually learn.
 
 DESIGN
@@ -26,7 +26,7 @@ DESIGN
 USAGE
 -----
     PYTHONPATH=. python scripts/train_tokenizer.py \\
-        --input data/corpus_v5/train.jsonl --vocab_size 32768 \\
+        --input data/corpus_v5/train.jsonl --vocab_size 49152 \\
         --out_dir tokenizer/akshara-bpe --compare Qwen/Qwen3.5-0.8B
 
 Prints chars/token per language on held-out docs (higher = better
@@ -45,9 +45,11 @@ import unicodedata
 
 from tokenizers import Regex, Tokenizer, decoders, models, normalizers, pre_tokenizers, trainers
 
-from scripts.prepare_data import MINORITY
+from scripts.prepare_data import MIX
 
-MINORITY_LANGS = {m[3] for m in MINORITY}
+# Everything that isn't a main-mix language (or an untagged script label) is a
+# minority language: covers hand-collected tags like thr/mgp/dhi automatically.
+MAIN_LANGS = {m[4] for m in MIX} | {"devanagari", "latin"}
 
 SPECIAL_TOKENS = [
     "<|bos|>", "<|eos|>", "<|pad|>",
@@ -88,7 +90,7 @@ def iter_texts(path: str, sample_bytes: int, seed: int, boost: float, counts: di
         for line in f:
             row = json.loads(line)
             lang = row.get("lang") or script_of(row["text"])
-            p = keep * boost if lang in MINORITY_LANGS else keep
+            p = keep * boost if lang not in MAIN_LANGS else keep
             if rng.random() < p:
                 counts[lang] = counts.get(lang, 0) + len(row["text"])
                 yield row["text"]
@@ -121,11 +123,15 @@ def main():
     ap = argparse.ArgumentParser(description="Train Akshara byte-level BPE tokenizer")
     ap.add_argument("--input", default="data/corpus_v5/train.jsonl")
     ap.add_argument("--eval", default=None, help="held-out JSONL for the report (default: --input sibling val.jsonl)")
-    ap.add_argument("--vocab_size", type=int, default=32768)
+    ap.add_argument("--vocab_size", type=int, default=49152)  # 48k beat 32k by 4–11% chars/token on every language at ~equal compute
     ap.add_argument("--sample_bytes", type=float, default=2e9, help="training sample size (bytes of JSONL)")
     ap.add_argument("--out_dir", default="tokenizer/akshara-bpe")
     ap.add_argument("--compare", default=None, help="HF tokenizer to compare against, e.g. Qwen/Qwen3.5-0.8B")
-    ap.add_argument("--boost", type=float, default=5.0, help="oversampling factor for minority languages")
+    # Full build: minority text (already repeated 4x) is ~9% of the corpus, so
+    # boost 2 puts it at ~17% of the tokenizer sample. Check the printed
+    # "training sample by language" line; on small test corpora where
+    # minorities dominate, use boost < 1.
+    ap.add_argument("--boost", type=float, default=2.0, help="sampling factor for minority languages (see comment)")
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
 
@@ -179,7 +185,7 @@ def main():
 
     print(f"[tokenizer] chars/token on held-out docs (higher is better)")
     print(f"  {'lang':<6} {'docs':>5}  {'ours ' + str(len(hf_tok)//1024) + 'k':>9}" + (f"  {args.compare:>20}" if ref else ""))
-    for lang in sorted(by_lang, key=lambda l: (l in MINORITY_LANGS, l)):
+    for lang in sorted(by_lang, key=lambda l: (l not in MAIN_LANGS, l)):
         texts = by_lang[lang]
         line = f"  {lang:<6} {len(texts):>5}  {chars_per_token(ours, texts):>9.2f}"
         if ref:

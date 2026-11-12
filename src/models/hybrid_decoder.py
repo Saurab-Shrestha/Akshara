@@ -57,11 +57,11 @@ with fla-org's implementation:
 Our PyTorch version is correct but runs the T-loop in Python (slow for long
 sequences). FLA's Triton kernel does the same math in one GPU pass.
 
-PARAMETER COUNT (v2 config: 32 layers, n_embed 1024, 32k vocab)
+PARAMETER COUNT (v2 config: 32 layers, n_embed 1024, 48k vocab)
 ----------------------------------------------------------------
   32 layers: 24 GDNBlock + 8 TransformerBlock                ≈ 393.0M
-  Token embedding (32,768 × 1024, tied with lm_head)          ≈  33.6M
-  Total unique                                                ≈ 426.6M
+  Token embedding (49,152 × 1024, tied with lm_head)          ≈  50.3M
+  Total unique                                                ≈ 443.4M
   (v1 used Qwen's 248k vocab: the embedding alone was 190M.)
 """
 
@@ -384,7 +384,7 @@ class HybridDecoder(nn.Module):
 
 # ── default config ─────────────────────────────────────────────────────────────
 DEFAULT_CONFIG = dict(   # v2 — mirrors configs/base.json
-    vocab_size  = 32_768,
+    vocab_size  = 49_152,
     n_embed     = 1024,
     n_heads     = 16,
     n_kv_heads  = 4,

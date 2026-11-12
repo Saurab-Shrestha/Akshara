@@ -1,6 +1,6 @@
 {
-  "_comment": "v2 architecture shared by all stages: own 32k BPE tokenizer, 1024 wide x 32 layers (24 GDN + 8 attention, 3:1), GQA 16q/4kv, QK-norm, 1024-token context → ~427M decoder params. v1 values are pinned in configs/a100_pretrain.json.",
-  "vocab_size": 32768,
+  "_comment": "v2 architecture shared by all stages: own 48k BPE tokenizer, 1024 wide x 32 layers (24 GDN + 8 attention, 3:1), GQA 16q/4kv, QK-norm, 1024-token context → ~443M decoder params. v1 values are pinned in configs/a100_pretrain.json.",
+  "vocab_size": 49152,
   "tokenizer": "tokenizer/akshara-bpe",
   "n_embed": 1024,
   "n_heads": 16,

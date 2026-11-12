@@ -2,7 +2,7 @@
 
 > **v2 note:** the numbers in this chapter are the original 12-layer, 248k-vocab
 > walkthrough. The v2 decoder is **32 layers × 1024 wide (24 GDN + 8 attention),
-> 32k own vocab, QK-norm → ~427M params (393M body, 34M embedding)**. The 3:1
+> 48k own vocab, QK-norm → ~443M params (393M body, 50M embedding)**. The 3:1
 > mechanics described here are unchanged. See [ROADMAP_V2.md](ROADMAP_V2.md).
 
 

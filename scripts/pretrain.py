@@ -10,7 +10,7 @@ WHY pretrain before OCR fine-tuning:
     simultaneously learn language and vision, which is harder and slower.
 
 TRAINING RECIPE (v2):
-    - Own 32k BPE tokenizer (cfg.tokenizer) + packed uint16 .bin shards.
+    - Own 48k BPE tokenizer (cfg.tokenizer) + packed uint16 .bin shards.
     - Muon on hidden matrices + AdamW on embeddings/norms (cfg.optimizer).
     - Cosine LR schedule with linear warmup.
     - bf16 autocast on A100; FLA Triton kernel for GDN.

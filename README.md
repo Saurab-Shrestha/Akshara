@@ -4,7 +4,7 @@
 
 > **This is a learning project.** The goal is to understand every stage of how a multimodal LLM is built: tokenizer, language pretraining, vision alignment, instruction tuning. We build and train everything ourselves except the vision backbone (pretrained DINOv2). Existing models (PaddleOCR-VL, Qwen-VL) are baselines and teachers, not replacements.
 
-> **Status:** v1 language pretrain ✅ done (`Saurab0/akshara-pretrain`, dev ppl ≈ 6.7). It showed that Qwen's borrowed 248k vocab ate most of the compute and that the model was under-trained on repeated data. **v2 is in progress:** own 32k tokenizer, 427M decoder, Muon, QK-norm, and a 3B+ token corpus. Code for stages 0–3 is done and smoke-tested; next step is building the corpus and running the pretrain.
+> **Status:** v1 language pretrain ✅ done (`Saurab0/akshara-pretrain`, dev ppl ≈ 6.7). It showed that Qwen's borrowed 248k vocab ate most of the compute and that the model was under-trained on repeated data. **v2 is in progress:** own 48k tokenizer, 443M decoder, Muon, QK-norm, and a 3B+ token corpus. Code for stages 0–3 is done and smoke-tested; next step is building the corpus and running the pretrain.
 
 **Plan: [docs/ROADMAP_V2.md](docs/ROADMAP_V2.md)** · Design: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) · OCR data plan: [docs/OCR_FINETUNE_PLAN.md](docs/OCR_FINETUNE_PLAN.md)
 
@@ -18,7 +18,7 @@ image ──► DINOv2-S/14 encoder (pretrained, 22M) ──► 1024 patch token
                                           Connector (MLP + RMSNorm) 384 → 1024
                                                         │  visual tokens replace <|image|>
                                                         ▼
-text  ──► akshara-bpe tokenizer (ours, 32k) ──► HybridDecoder (ours, 427M) ──► text
+text  ──► akshara-bpe tokenizer (ours, 48k) ──► HybridDecoder (ours, 443M) ──► text
                                                 32 layers, 1024 wide
                                                 24 Gated DeltaNet + 8 attention (3:1)
                                                 GQA 16q/4kv, RoPE, QK-norm
@@ -28,7 +28,7 @@ The decoder alternates Gated DeltaNet (GDN) recurrence layers with full-attentio
 
 For full documents, pretrained Surya layout/table models split the page into regions and the model reads each crop (`src/pipeline.py`, region class → `<p>`/`<h1>`/`<table>`).
 
-**Size:** 427M decoder (34M of it embedding) + 22M vision + ~1.1M connector ≈ 450M total.
+**Size:** 443M decoder (50M of it embedding) + 22M vision + ~1.1M connector ≈ 466M total.
 
 ---
 
@@ -37,7 +37,7 @@ For full documents, pretrained Surya layout/table models split the page into reg
 | Stage | Script | What trains | Data | Status |
 |---|---|---|---|---|
 | 0 — Corpus | `prepare_data.py` | — | FineWeb-2 ne/hi/mr/sa 60% · FineWeb-Edu 30% · FineMath 3% · Wikipedia 7%, ~12B chars | code ✅ |
-| 1 — Tokenizer | `train_tokenizer.py` | 32k byte-level BPE | corpus sample | code ✅ |
+| 1 — Tokenizer | `train_tokenizer.py` | 48k byte-level BPE | corpus sample | code ✅ |
 | 2 — Pack | `tokenize_corpus.py` | — | corpus → uint16 `.bin` | code ✅ |
 | 3 — Pretrain | `pretrain.py` | decoder | ~3.2B tokens (Chinchilla: 8.5B) | code ✅, **run next** |
 | 4 — Align | to build | connector | image–caption pairs (LLaVA-Pretrain) | designed |
@@ -98,7 +98,7 @@ PYTHONPATH=. python scripts/prepare_data.py --out_dir data/corpus_v5
 
 # 1. tokenizer: prints chars/token vs Qwen; commit tokenizer/akshara-bpe/
 PYTHONPATH=. python scripts/train_tokenizer.py --input data/corpus_v5/train.jsonl \
-    --vocab_size 32768 --out_dir tokenizer/akshara-bpe --compare Qwen/Qwen3.5-0.8B
+    --vocab_size 49152 --out_dir tokenizer/akshara-bpe --compare Qwen/Qwen3.5-0.8B
 
 # 2. pack into uint16 token files
 PYTHONPATH=. python scripts/tokenize_corpus.py --input data/corpus_v5/train.jsonl
@@ -109,7 +109,7 @@ PYTHONPATH=. python scripts/pretrain.py --config configs/a100_pretrain_v2.json
 #    resume: --resume checkpoints/pretrain_v2.pt
 ```
 
-**Compute warning:** 3.2B tokens at 427M params is ~8e18 FLOPs, so **~18 h on an A100 at 40% MFU, ~63 h at v1's measured efficiency**. Measure tok/s in the first 100 steps and set `train_steps` from that. See [ROADMAP_V2.md §3](docs/ROADMAP_V2.md).
+**Compute warning:** 3.2B tokens at 443M params is ~8.5e18 FLOPs, so **~19 h on an A100 at 40% MFU, ~66 h at v1's measured efficiency**. Measure tok/s in the first 100 steps and set `train_steps` from that. See [ROADMAP_V2.md §3](docs/ROADMAP_V2.md).
 
 **Language eval** (works on v1 and v2 checkpoints):
 
@@ -228,7 +228,7 @@ akshara/
 │   └── generate.py             # Inference script
 ├── configs/
 │   ├── base.json               # Shared v2 architecture
-│   ├── a100_pretrain_v2.json   # v2 pretrain (427M, Muon)
+│   ├── a100_pretrain_v2.json   # v2 pretrain (443M, Muon)
 │   ├── a100_pretrain.json      # v1 pretrain (historical, pinned)
 │   ├── ocr_finetune.json       # Stage 2/3 training config
 │   └── smoke/                  # Fast smoke-test configs
