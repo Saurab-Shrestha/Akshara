@@ -39,7 +39,29 @@ languages fixes both, and building it is a lesson in its own right.
 48k wins on every language by 4–11%. It adds 17M embedding params (+4%)
 and ~4% compute per token, but needs ~5% fewer tokens for the same text, so
 the compute per character is about the same and the context holds more text.
-**v2 uses 48k (49,152).** These numbers come from a 200M-char test corpus that
+### Per-language floor (2026-11-12, full test corpus with all sources)
+
+A flat oversampling factor can't help a language with 5M chars in a 2 GB
+sample. Limbu reached only 1.92 chars/token. `--floor` guarantees every
+minority language a minimum share of the tokenizer sample (default 1.5% of the
+main-language sample, or all of its text if it has less):
+
+| Lang | No floor | **Floor 1.5%** | Qwen 248k |
+|---|---|---|---|
+| Limbu | 1.92 | **3.37** | 0.56 |
+| Sherpa | 2.63 | **4.13** | 1.41 |
+| Tamang | 3.20 | **4.09** | 1.31 |
+| Sunwar | 3.22 | **3.66** | 1.26 |
+| Tharu | 2.80 | **3.13** | 1.47 |
+| Awadhi / Doteli | 3.27 / 3.43 | **3.43 / 3.59** | ~1.4 |
+| Maithili / Bhojpuri / Newari | 3.47 / 3.42 / 3.32 | 3.46 / 3.43 / 3.26 | ~1.4 |
+| Santali (Ol Chiki) | 2.97 | 2.91 | 0.43 |
+| Nepali / Hindi / English | 4.60 / 3.86 / 4.08 | 4.54 / 3.82 / 4.01 | 1.44 / 1.56 / 4.32 |
+
+The cost is about −1.5% on the main languages. Small-language gains are probably
+inflated: their text is mostly Bible translation and they have only 2–6 held-out docs.
+
+**v2 uses 48k (49,152) with the 1.5% floor.** These numbers come from a 200M-char test corpus that
 lacked the Newari fix and the hand-collected sources. Re-measure on the full corpus.
 
 ---

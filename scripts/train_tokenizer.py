@@ -76,7 +76,19 @@ def build_tokenizer() -> Tokenizer:
     return tok
 
 
-def iter_texts(path: str, sample_bytes: int, seed: int, boost: float, counts: dict):
+def lang_chars(path: str) -> dict[str, int]:
+    """One counting pass: characters per language tag."""
+    out: dict[str, int] = {}
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            row = json.loads(line)
+            lang = row.get("lang") or script_of(row["text"])
+            out[lang] = out.get(lang, 0) + len(row["text"])
+    return out
+
+
+def iter_texts(path: str, sample_bytes: int, seed: int, boost: float, counts: dict,
+               floor: float = 0.015):
     """Yield a random sample of ~sample_bytes from a JSONL corpus.
 
     prepare_data.py writes sources one after another (Nepali, then Hindi, …),
@@ -84,13 +96,21 @@ def iter_texts(path: str, sample_bytes: int, seed: int, boost: float, counts: di
     tagged with a minority language are kept `boost`× more often: BPE only
     learns merges for text it sees, and Maithili/Limbu/… are <1% of the corpus.
     """
-    keep = min(1.0, sample_bytes / max(1, os.path.getsize(path)))
+    size = os.path.getsize(path)
+    keep = min(1.0, sample_bytes / max(1, size))
+    # Floor: each minority language gets ≥ `floor` of the sample (or all its
+    # text). A flat boost can't help Limbu with 5M chars in a 2 GB sample.
+    totals = lang_chars(path)
+    # floor is a share of the main-language sample (what the sample mostly is)
+    sample_chars = keep * sum(c for l, c in totals.items() if l in MAIN_LANGS)
+    p_lang = {l: max(keep * boost, min(1.0, floor * sample_chars / max(1, c)))
+              for l, c in totals.items() if l not in MAIN_LANGS}
     rng = random.Random(seed)
     with open(path, encoding="utf-8") as f:
         for line in f:
             row = json.loads(line)
             lang = row.get("lang") or script_of(row["text"])
-            p = keep * boost if lang not in MAIN_LANGS else keep
+            p = p_lang.get(lang, keep)
             if rng.random() < p:
                 counts[lang] = counts.get(lang, 0) + len(row["text"])
                 yield row["text"]
@@ -132,6 +152,9 @@ def main():
     # "training sample by language" line; on small test corpora where
     # minorities dominate, use boost < 1.
     ap.add_argument("--boost", type=float, default=2.0, help="sampling factor for minority languages (see comment)")
+    # 1.5%/language measured 2026-11-12: Limbu 1.92→3.37 chars/token, Tamang
+    # 3.20→4.09, at −1.5% on English/Nepali/Hindi.
+    ap.add_argument("--floor", type=float, default=0.015, help="min sample share per minority language (vs main sample)")
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
 
@@ -149,7 +172,7 @@ def main():
     print(f"[tokenizer] training {args.vocab_size:,}-vocab BPE on ~{args.sample_bytes/1e9:.1f} GB of {args.input}")
     counts: dict[str, int] = {}
     tok.train_from_iterator(
-        iter_texts(args.input, int(args.sample_bytes), args.seed, args.boost, counts), trainer=trainer)
+        iter_texts(args.input, int(args.sample_bytes), args.seed, args.boost, counts, args.floor), trainer=trainer)
     total = sum(counts.values())
     print("[tokenizer] training sample by language: " + ", ".join(
         f"{l} {c/total:.1%}" for l, c in sorted(counts.items(), key=lambda x: -x[1])))
