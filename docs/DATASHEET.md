@@ -75,6 +75,25 @@ with manifests `MANIFEST_hf.json` and `MANIFEST_web.json`.
 TODO: summarize per language and license here once the manifests are final.
 List the "needs user" sources (registration or unclear license) separately.
 
+**Polite crawl (2026-11-12/13).** Train-only unless openly licensed:
+
+| Source | Lang | Docs | Chars | License |
+|---|---|---|---|---|
+| NepalMandal (1,175 of 2,244 articles; stopped when the server began dropping connections) | new | 1,168 | 2.37M | all rights reserved |
+| Kirat Yakthung Chumlung (Limbu-script paragraphs only) | lif | 9 | 5.5K | none stated |
+| Pangloss | klr / taj | 8 / 1 | 51K / 1.5K | CC BY-NC-ND / NC-SA 2.5 |
+| Yakkha grammar (langsci/66) | ybh | 23 | 61K | CC BY 4.0 (publishable) |
+| Rising Voices | the | 1 | 7.6K | CC BY 3.0 (publishable) |
+| CulturaX | new / bho / mai | 3,995 / 208 / 48 | 3.6M total | mC4 + OSCAR terms |
+
+**Sikkim Herald language editions:** 126 PDFs are archived in
+`data/extra_langs/raw/sikkim_herald/` (lif 39, xsr 29, suz 26, mgp 17, gvr 7,
+bap 4, taj 4; there is no Newar edition). None has a Unicode text layer. They use
+legacy ASCII fonts (Limbu "Srijonga", Sunwar "kirat1"/"Shipmoo", Tibetan-script
+fonts for Tamang/Sherpa, a "Magar" font), and Gurung is image-only. Unlocking
+them needs per-font Unicode maps (ask the Sikkim IPR Department) or OCR.
+The Rai edition appears to use the Kirat Rai script (Unicode U+16D40, added 2024).
+
 **Is anything confidential or personal?** The sources are public web text,
 Wikipedia and published translations. Web text can contain names and
 contact details of private individuals. TODO: decide on PII filtering

@@ -93,8 +93,16 @@ python -c "from PIL import features; print(features.check('raqm'))"   # → True
 ## Data & pretraining (v2)
 
 ```bash
-# 0. corpus: ~12B chars ≈ 3.4B tokens, ~30 GB JSONL (use --total_chars 30e9 for Chinchilla 8.5B)
-PYTHONPATH=. python scripts/prepare_data.py --out_dir data/corpus_v5
+# 0a. Nepali sources beyond FineWeb-2: ~18B chars available, all permissive.
+#     HPLT 2.0 / IndicCorpV2 (CC0), FinePDFs (ODC-BY), GlotCC (CC0), DCAD (train-only).
+python scripts/collect_nepali.py --list        # sources, licenses, configs
+python scripts/collect_nepali.py --sources hplt2,indiccorp,finepdfs
+python scripts/collect_nepali.py               # all five -> data/nepali/*.jsonl
+
+# 0b. corpus: ~12B chars ≈ 3.4B tokens, ~30 GB JSONL (use --total_chars 30e9 for Chinchilla 8.5B)
+#     --nepali_share (default 0.15) is carved out of fineweb2/ne; raise it for a
+#     more Nepali-heavy model (0.30 retires FineWeb-2 Nepali entirely).
+PYTHONPATH=. python scripts/prepare_data.py --out_dir data/corpus_v5 --nepali_share 0.20
 
 # 1. tokenizer: prints chars/token vs Qwen; commit tokenizer/akshara-bpe/
 PYTHONPATH=. python scripts/train_tokenizer.py --input data/corpus_v5/train.jsonl \
@@ -108,6 +116,8 @@ PYTHONPATH=. python scripts/tokenize_corpus.py --input data/corpus_v5/val.jsonl
 PYTHONPATH=. python scripts/pretrain.py --config configs/a100_pretrain_v2.json
 #    resume: --resume checkpoints/pretrain_v2.pt
 ```
+
+**Nepali collection** is append-safe: rerunning a source skips documents already on disk (`--restart` truncates). `--max_chars` caps a source — e.g. `--max_chars 3e9` on HPLT keeps ~9 GB of JSONL instead of all ~11B chars. Parquet shards are downloaded one at a time to `~/.cache/akshara_nepali` and deleted after reading; `data/nepali/MANIFEST.json` records license, volume and filter counts per source.
 
 **Compute warning:** 3.2B tokens at 443M params is ~8.5e18 FLOPs, so **~19 h on an A100 at 40% MFU, ~66 h at v1's measured efficiency**. Measure tok/s in the first 100 steps and set `train_steps` from that. See [ROADMAP_V2.md §3](docs/ROADMAP_V2.md).
 

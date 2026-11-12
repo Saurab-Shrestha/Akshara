@@ -17,6 +17,17 @@ SOURCES (share of total characters)
     FineWeb-Edu en 30%                             (EduScore ≥ 3)
     FineMath    3%     (finemath-4plus: digits, equations, reasoning text)
     Wikipedia   ne 3% · hi 2% · en 2%              (curated)
+    Nepali extra  --nepali_share (default 15%, carved out of FineWeb-2 ne)
+
+NEPALI SOURCES
+--------------
+scripts/collect_nepali.py downloads HPLT 2.0, IndicCorpV2, FinePDFs, GlotCC
+and DCAD-2000 for Nepali into data/nepali/*.jsonl. They join MIX as ordinary
+budgeted sources (not through extra_langs, which is held in RAM and repeated
+up to 4x for minority languages). Their weights inside --nepali_share are in
+NEPALI below; files that are absent are skipped and the rest renormalized.
+Rationale: they are independent crawl/filter pipelines, so they add document
+diversity that FineWeb-2 alone cannot.
 
 English is 30%+ (up from v1's 20%) because the MLLM instruction data
 (LLaVA, Cauldron, Docmatix) is mostly English. If a source runs dry before
@@ -71,6 +82,18 @@ MIX = [
 ]
 assert abs(sum(m[3] for m in MIX) - 1.0) < 1e-9
 
+# Nepali sources produced by scripts/collect_nepali.py. Weights are relative
+# *inside* --nepali_share; the budget is taken out of fineweb2/ne so MIX still
+# sums to 1.0. (label, loader, filename, weight, lang tag, train_only)
+NEPALI = [
+    ("nepali/hplt2",     "hfjsonl", "hf_hplt2_npi.jsonl",      0.36, "npi", False),
+    ("nepali/indiccorp", "hfjsonl", "hf_indiccorp_npi.jsonl",  0.30, "npi", False),
+    ("nepali/finepdfs",  "hfjsonl", "hf_finepdfs_npi.jsonl",   0.18, "npi", False),
+    ("nepali/glotcc",    "hfjsonl", "hf_glotcc_npi.jsonl",     0.08, "npi", False),
+    ("nepali/dcad2000",  "hfjsonl", "hf_dcad2000_npi.jsonl",   0.08, "npi", True),
+]
+DEFAULT_NEPALI_SHARE = 0.15
+
 # Languages of Nepal with little web text. Too small for a % budget: take ALL
 # of it and repeat it MINORITY_REPEATS times (Muennighoff et al. 2023: up to
 # ~4 epochs of repeated data is nearly as good as fresh data). Rai languages
@@ -124,6 +147,14 @@ def stream_texts(kind: str, arg: str | None, quality: int):
         ds = load_dataset("HuggingFaceTB/finemath", "finemath-4plus", split="train", streaming=True)
     elif kind == "wiki":
         ds = load_dataset("wikimedia/wikipedia", arg, split="train", streaming=True)
+    elif kind == "hfjsonl":
+        # Local corpus from scripts/collect_nepali.py: one {"text",...} per line.
+        with open(arg, encoding="utf-8") as f:
+            for line in f:
+                t = (json.loads(line).get("text") or "").strip()
+                if len(t) >= 50:
+                    yield t
+        return
     else:
         raise ValueError(kind)
 
@@ -208,20 +239,58 @@ def _row(text: str, lang: str, train_only: bool = False) -> str:
     return json.dumps(row, ensure_ascii=False) + "\n"
 
 
+def nepali_jobs(nepali_dir: str, share: float) -> list[tuple]:
+    """Resolve the NEPALI registry to concrete (label, kind, path, share, lang,
+    train_only) jobs. Missing files are skipped and the remaining weights are
+    renormalized, so a partial download still produces a full 1.0 mix."""
+    if share <= 0 or not os.path.isdir(nepali_dir):
+        return []
+    present = [n for n in NEPALI if os.path.exists(os.path.join(nepali_dir, n[2]))]
+    if not present:
+        return []
+    w = sum(n[3] for n in present)
+    jobs = [(label, kind, os.path.join(nepali_dir, fn), share * weight / w, lang, nc)
+            for label, kind, fn, weight, lang, nc in present]
+    print(f"[nepali] {len(present)}/{len(NEPALI)} source(s) on disk: "
+          + ", ".join(f"{j[0].split('/')[-1]} {j[3]:.1%}" for j in jobs))
+    return jobs
+
+
 def prepare_corpus(total_chars: float, out_dir: str, quality: int,
                    minority: bool = True, seed: int = 42,
-                   extra_dir: str = "data/extra_langs"):
+                   extra_dir: str = "data/extra_langs",
+                   nepali_share: float = DEFAULT_NEPALI_SHARE,
+                   nepali_dir: str = "data/nepali"):
     os.makedirs(out_dir, exist_ok=True)
+
+    # Nepali extra sources are paid for out of fineweb2/ne, so MIX still sums
+    # to 1.0 and the total character budget is unchanged.
+    take = 0.0
+    extra = nepali_jobs(nepali_dir, nepali_share)
+    if extra:
+        fw = next(m[3] for m in MIX if m[0] == "fineweb2/ne")
+        take = min(nepali_share, fw)
+        if take < nepali_share:
+            print(f"[nepali] --nepali_share {nepali_share:.0%} > fineweb2/ne {fw:.0%}; "
+                  f"using {take:.0%}")
+            extra = nepali_jobs(nepali_dir, take)
+    jobs = []
+    for label, kind, arg, share, lang in (m[:5] for m in MIX):
+        jobs.append((label, kind, arg, share - take if label == "fineweb2/ne" else share,
+                     lang, False))
+    jobs += extra
+    assert abs(sum(j[3] for j in jobs) - 1.0) < 1e-9
+
     stats = {}
     with open(os.path.join(out_dir, "train.jsonl"), "w", encoding="utf-8") as ftr, \
          open(os.path.join(out_dir, "val.jsonl"), "w", encoding="utf-8") as fva:
-        for label, kind, arg, share, lang in MIX:
+        for label, kind, arg, share, lang, nc in jobs:
             budget = int(total_chars * share)
             got, docs, t0 = 0, 0, time.time()
             print(f"[{label}] target {budget/1e6:,.0f}M chars")
             try:
                 for text in stream_texts(kind, arg, quality):
-                    (fva if is_val(text) else ftr).write(_row(text, lang))
+                    (fva if is_val(text) else ftr).write(_row(text, lang, nc))
                     got += len(text)
                     docs += 1
                     if docs % 50_000 == 0:
@@ -291,9 +360,10 @@ def prepare_corpus(total_chars: float, out_dir: str, quality: int,
                                if k < (1 if b else reps[l]))
 
     total = sum(c for _, c in stats.values())
-    print(f"\n[data] {total/1e9:.2f}B chars (≈{total/3.5/1e9:.2f}B tokens) → {out_dir}/")
+    fmt = lambda n: f"{n/1e9:.2f}B" if n >= 1e9 else f"{n/1e6:,.1f}M"
+    print(f"\n[data] {fmt(total)} chars (≈{total/3.5/1e9:.2f}B tokens) → {out_dir}/")
     for label, (docs, chars) in stats.items():
-        print(f"  {label:<18} {docs:>10,} docs  {chars/1e6:>9,.1f}M chars  {chars/max(1,total):6.2%}")
+        print(f"  {label:<18} {docs:>10,} docs  {fmt(chars):>9} chars  {chars/max(1,total):6.2%}")
 
 
 def main():
@@ -304,9 +374,14 @@ def main():
     ap.add_argument("--no_minority", action="store_true", help="skip the minority-language sources")
     ap.add_argument("--extra_dir", default="data/extra_langs",
                     help="hand-collected minority-language JSONL ({text, lang, source})")
+    ap.add_argument("--nepali_share", type=float, default=DEFAULT_NEPALI_SHARE,
+                    help="share of total chars from data/nepali/ (carved out of fineweb2/ne); 0 disables")
+    ap.add_argument("--nepali_dir", default="data/nepali",
+                    help="output of scripts/collect_nepali.py")
     args = ap.parse_args()
     prepare_corpus(args.total_chars, args.out_dir, args.quality,
-                   minority=not args.no_minority, extra_dir=args.extra_dir)
+                   minority=not args.no_minority, extra_dir=args.extra_dir,
+                   nepali_share=args.nepali_share, nepali_dir=args.nepali_dir)
 
 
 if __name__ == "__main__":

@@ -63,3 +63,6 @@ __notebook__.ipynb
 
 # Hand-collected minority-language text (see scripts/prepare_data.py)
 data/extra_langs/
+
+# Nepali corpora from scripts/collect_nepali.py (multi-GB, rebuildable)
+data/nepali/
