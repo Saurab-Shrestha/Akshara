@@ -17,5 +17,6 @@
   "device": "cuda",
   "amp_dtype": "bf16",
   "seed": 42,
-  "use_fla": false
+  "use_fla": false,
+  "gdn_impl": "native"
 }

@@ -65,6 +65,8 @@ def main():
     ap.add_argument("--out", default=None, help="default: input with .bin extension")
     ap.add_argument("--batch", type=int, default=2000)
     ap.add_argument("--max_repeats", type=int, default=32, help="repeated n-gram filter; 0 disables")
+    ap.add_argument("--min_tokens", type=int, default=0,
+                    help="keep only docs with at least this many tokens (long-context stage data)")
     args = ap.parse_args()
 
     from transformers import AutoTokenizer
@@ -84,6 +86,8 @@ def main():
             bad = repeated_docs(ids, args.max_repeats)
             dropped.update(langs[i] for i in bad)
             ids = [d for i, d in enumerate(ids) if i not in bad]
+        if args.min_tokens:
+            ids = [d for d in ids if len(d) >= args.min_tokens]
         flat = np.fromiter(
             (t for doc in ids for t in (bos, *doc, eos)), dtype=np.uint16,
             count=sum(len(d) + 2 for d in ids),

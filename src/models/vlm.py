@@ -83,6 +83,8 @@ class Akshara(nn.Module):
         attn_every:  int = 4,
         use_fla:     bool = False,
         qk_norm:     bool = False,
+        gdn_impl:    str = "fla_layer",
+        rope_theta:  float = 10000.0,
     ):
         super().__init__()
 
@@ -111,6 +113,8 @@ class Akshara(nn.Module):
             attn_every  = attn_every,
             use_fla     = use_fla,
             qk_norm     = qk_norm,
+            gdn_impl    = gdn_impl,
+            rope_theta  = rope_theta,
         )
 
     def forward(

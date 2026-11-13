@@ -1,7 +1,7 @@
 {
-  "_comment": "v2 pretrain (443M decoder) on A100 40GB, bf16 + FLA. 8x1024x12 = 98k tokens/step x 90k steps ≈ 8.9B tokens (≈1 epoch of corpus_v6, Chinchilla for 443M). WSD schedule: flat LR, then the last 15% of steps decay on anneal.bin (prepare_data.py --mix anneal). Spans many sessions: resume from the HF backup. OOM → lower batch_size, raise grad_accum (keep the product).",
+  "_comment": "v2 pretrain (443M decoder) on A100 40GB, bf16 + FLA. 4x2048x12 = 98k tokens/step x 90k steps ≈ 8.9B tokens (≈1 epoch of corpus_v6, Chinchilla for 443M). WSD schedule: flat LR, then the last 15% of steps decay on anneal.bin (prepare_data.py --mix anneal). Spans many sessions: resume from the HF backup. OOM → lower batch_size, raise grad_accum (keep the product).",
   "device": "cuda",
-  "batch_size": 8,
+  "batch_size": 4,
   "grad_accum": 12,
   "use_gradient_checkpointing": false,
   "train_steps": 90000,
@@ -27,5 +27,6 @@
   "anneal_path": "data/corpus_anneal/train.bin",
   "ce_chunk": 8192,
   "no_wd_embed": true,
-  "z_loss": 1e-05
+  "z_loss": 1e-05,
+  "max_seq_len": 2048
 }

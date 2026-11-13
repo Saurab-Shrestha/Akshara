@@ -180,6 +180,8 @@ def main() -> None:
         vit_layers  = saved_config.get("vit_layers",  12),
         vit_heads   = saved_config.get("vit_heads",   6),
         qk_norm     = saved_config.get("qk_norm",     False),
+        gdn_impl    = saved_config.get("gdn_impl",    "fla_layer"),
+        rope_theta  = saved_config.get("rope_theta",  10000.0),
         vit_pretrained = False,  # weights come from the checkpoint
     )
     model.load_state_dict(ck["model_state_dict"])

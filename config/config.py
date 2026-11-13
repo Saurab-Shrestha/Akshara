@@ -63,6 +63,8 @@ class ModelConfig:
     max_seq_len: int = 512            # text tokens per crop (a dense paragraph fits)
     attn_every: int = 4               # full attention every N layers; others use GDN
     qk_norm: bool = False             # v2: RMS-normalise Q/K per head in attention
+    gdn_impl: str = "fla_layer"       # v2: "native" (own GDN weights, FLA kernel on CUDA, decodes anywhere)
+    rope_theta: float = 10000.0       # RoPE base; raised for long-context extension
 
     # Vision encoder (DINOv2-S/14, pretrained)
     img_size: int = 448               # crop canvas size (aspect-preserving pad)
@@ -132,6 +134,7 @@ class PretrainConfig(ModelConfig):
     anneal_path: Optional[str] = None # wsd only: train on this .bin during the decay phase
     no_wd_embed: bool = False         # v2: no weight decay on the token embedding
     z_loss: float = 0.0               # v2: 1e-5 (SmolLM3), keeps logits from drifting large
+    init_ckpt: Optional[str] = None   # start from these weights (fresh optimizer/schedule), e.g. long-context stage
 
     # Checkpointing
     out_ckpt: str = "checkpoints/pretrain.pt"

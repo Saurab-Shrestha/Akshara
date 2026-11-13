@@ -135,12 +135,16 @@ class MultiHeadAttention(nn.Module):
         self.q_norm = RMSNorm(self.head_dim) if qk_norm else None
         self.k_norm = RMSNorm(self.head_dim) if qk_norm else None
 
-    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
+                cache: dict | None = None) -> torch.Tensor:
         """
         Args:
-            x:   (batch, seq_len, n_embed)
-            cos: (seq_len, head_dim // 2) — RoPE cosine table
-            sin: (seq_len, head_dim // 2) — RoPE sine table
+            x:     (batch, seq_len, n_embed)
+            cos:   (seq_len, head_dim // 2) — RoPE cosine table for x's positions
+            sin:   (seq_len, head_dim // 2) — RoPE sine table for x's positions
+            cache: KV cache dict, updated in place. Keys/values of earlier tokens
+                   (already rotated) live in cache["k"], cache["v"], so each new
+                   token costs one row of attention instead of recomputing all.
 
         Returns:
             (batch, seq_len, n_embed)
@@ -170,10 +174,27 @@ class MultiHeadAttention(nn.Module):
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
 
+        # ── KV cache: prepend earlier tokens' keys/values ────────────────────
+        past = 0
+        if cache is not None:
+            if "k" in cache:
+                past = cache["k"].shape[2]
+                k = torch.cat([cache["k"], k], dim=2)
+                v = torch.cat([cache["v"], v], dim=2)
+            cache["k"], cache["v"] = k, v
+
         # ── Fused causal attention. enable_gqa shares each KV head across
         #    n_rep query heads without materialising repeated K/V copies.
+        #    With a cache, new token i sees all `past` tokens plus new 0..i.
+        if past == 0:
+            mask, causal = None, True
+        elif T == 1:
+            mask, causal = None, False
+        else:
+            mask = torch.ones(T, past + T, dtype=torch.bool, device=x.device).tril(diagonal=past)
+            causal = False
         out = F.scaled_dot_product_attention(
-            q, k, v, is_causal=True, enable_gqa=self.n_rep > 1,
+            q, k, v, attn_mask=mask, is_causal=causal, enable_gqa=self.n_rep > 1,
         )
 
         # ── Merge heads and project ──────────────────────────────────────────

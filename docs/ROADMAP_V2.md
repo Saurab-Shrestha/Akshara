@@ -191,6 +191,32 @@ fallback is a 768 × 20 config (163M, ~3× cheaper).
 Gate to move on: `lm_eval.py` on the v2 checkpoint should match or beat v1 on
 Nepali and clearly beat it on English.
 
+### Stage 3b — Long context 2k → 16k (`configs/a100_longctx_v2.json`)
+
+Pretraining runs at 2048 tokens. Only 8 of 32 layers are attention, so this
+costs ~8% extra compute per token over the weights, vs ~4% at 1024. After
+pretraining, extend to 16k as a separate short stage (Smol Training Playbook):
+start from the finished weights (`init_ckpt`), raise the RoPE base 10k → 1M
+(`rope_theta`, "ABF"), and train ~400M tokens of long documents with a fresh
+schedule:
+
+```bash
+PYTHONPATH=. python scripts/tokenize_corpus.py --input data/corpus_v6/train.jsonl \
+    --min_tokens 4096 --out data/corpus_long/train.bin
+PYTHONPATH=. python scripts/pretrain.py --config configs/a100_longctx_v2.json
+```
+
+RoPE tables are not stored in checkpoints, so 2k weights load into the 16k
+model. Check with a needle-in-a-haystack test afterwards. Not done yet:
+intra-document masking (the playbook calls it important for long context;
+needs FLA `cu_seqlens` + a FlexAttention block mask).
+
+**Inference.** `HybridDecoder.generate()` keeps a KV cache for the attention
+layers and the fixed-size memory for the GDN layers, so each new token costs
+one step. `src/speculative.py` adds speculative decoding: the 148M proxy drafts
+k tokens, the 443M model checks them in one pass. Greedy output is identical to
+the 443M model's own; sampling keeps its distribution (tests/test_inference.py).
+
 ### Stage 4 — Alignment (to build)
 
 Freeze DINOv2 and the decoder; train only the connector on image–caption

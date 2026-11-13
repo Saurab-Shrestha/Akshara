@@ -273,6 +273,8 @@ def main() -> None:
         attn_every=cfg.attn_every,
         use_fla=cfg.use_fla,
         qk_norm=cfg.qk_norm,
+        gdn_impl=cfg.gdn_impl,
+        rope_theta=cfg.rope_theta,
     )
     if cfg.use_gradient_checkpointing:
         model.set_gradient_checkpointing(True)
@@ -283,6 +285,13 @@ def main() -> None:
     # --- optional resume (before compile / DataParallel so keys match) ---
     start_step = 0
     ck = None
+    if cfg.init_ckpt and not (args.resume and os.path.exists(args.resume)):
+        # New stage from earlier weights (e.g. 2k → 16k context): weights only.
+        # RoPE tables are rebuilt from this config's max_seq_len / rope_theta.
+        init = torch.load(cfg.init_ckpt, map_location="cpu", weights_only=False)["model_state_dict"]
+        model.load_state_dict({k.removeprefix("_orig_mod.").removeprefix("module."): v for k, v in init.items()})
+        print(f"[pretrain] initialised weights from {cfg.init_ckpt}")
+        del init
     if args.resume and os.path.exists(args.resume):
         ck = torch.load(args.resume, map_location="cpu", weights_only=False)
         sd = {k.removeprefix("_orig_mod.").removeprefix("module."): v

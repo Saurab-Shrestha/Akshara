@@ -69,7 +69,8 @@ class TransformerBlock(nn.Module):
         self.norm2 = RMSNorm(n_embed)
         self.mlp   = SwiGLU(n_embed)
 
-    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
+                cache: dict | None = None, keep_states: bool = False) -> torch.Tensor:
         """
         Args:
             x:   (batch, seq_len, n_embed)
@@ -79,7 +80,8 @@ class TransformerBlock(nn.Module):
         Returns:
             (batch, seq_len, n_embed)
         """
-        x = x + self.attn(self.norm1(x), cos, sin)
+        # keep_states is for GDN blocks; a KV cache rolls back by slicing
+        x = x + self.attn(self.norm1(x), cos, sin, cache)
         x = x + self.mlp(self.norm2(x))
         return x
 

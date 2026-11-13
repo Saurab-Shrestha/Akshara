@@ -250,6 +250,8 @@ def main() -> None:
         vit_pretrained=cfg.vit_pretrained,
         use_fla=cfg.use_fla,
         qk_norm=cfg.qk_norm,
+        gdn_impl=cfg.gdn_impl,
+        rope_theta=cfg.rope_theta,
     )
     if cfg.use_gradient_checkpointing:
         model.set_gradient_checkpointing(True)

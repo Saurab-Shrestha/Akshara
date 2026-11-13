@@ -1,5 +1,5 @@
 {
-  "_comment": "Ablation proxy (Smol Training Playbook: change one thing at a time, matched params, decay every run). 768 wide x 16 layers hybrid 3:1 \u2248 148M params (110M non-embedding), same tokenizer/data/recipe as the 443M run. 16x1024x6 = 98k tokens/step x 10.2k steps \u2248 1B tokens each, WSD with its own decay so final dev losses are comparable. ~2.5-7 A100-hours per run.",
+  "_comment": "Ablation proxy (Smol Training Playbook: change one thing at a time, matched params, decay every run). 768 wide x 16 layers hybrid 3:1 ≈ 148M params (110M non-embedding), same tokenizer/data/recipe as the 443M run. 16x1024x6 = 98k tokens/step x 10.2k steps ≈ 1B tokens each, WSD with its own decay so final dev losses are comparable. ~2.5-7 A100-hours per run.",
   "vocab_size": 49152,
   "tokenizer": "tokenizer/akshara-bpe",
   "n_embed": 768,
@@ -36,5 +36,6 @@
   "save_every": 500,
   "train_path": "data/corpus_v6/train.bin",
   "dev_path": "data/corpus_v6/val.bin",
-  "hf_repo": "Saurab0/akshara-ablations"
+  "hf_repo": "Saurab0/akshara-ablations",
+  "gdn_impl": "native"
 }

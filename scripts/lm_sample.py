@@ -33,6 +33,8 @@ def load(ckpt_path, device):
         max_seq_len=c["max_seq_len"], attn_every=c["attn_every"],
         use_fla=c.get("use_fla", False),
         qk_norm=c.get("qk_norm", False),
+        gdn_impl=c.get("gdn_impl", "fla_layer"),
+        rope_theta=c.get("rope_theta", 10000.0),
     )
     model.load_state_dict(ck["model_state_dict"])
     model.to(device).eval()
@@ -46,17 +48,9 @@ def generate(model, tok, prompt, device, max_seq_len, max_new=50, temperature=0.
     eos = tok.eos_token_id           # training used EOS as the BOS sentinel
     ids = [eos] + tok.encode(prompt)
     x = torch.tensor([ids], device=device)
-    for _ in range(max_new):
-        logits, _ = model(x[:, -max_seq_len:])
-        logits = logits[0, -1].float() / temperature
-        if top_k:
-            v, _ = torch.topk(logits, top_k)
-            logits[logits < v[-1]] = -float("inf")
-        nxt = torch.multinomial(torch.softmax(logits, -1), 1).item()
-        if nxt == eos:
-            break
-        x = torch.cat([x, torch.tensor([[nxt]], device=device)], dim=1)
-    return tok.decode(x[0, 1:].tolist())
+    max_new = min(max_new, max_seq_len - len(ids))
+    out = model.generate(x, max_new, temperature=temperature, top_k=top_k, eos_token_id=eos)[0, 1:].tolist()
+    return tok.decode(out[: out.index(eos)] if eos in out[len(ids) - 1:] else out)
 
 
 def main():

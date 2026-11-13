@@ -16,5 +16,6 @@
   "amp_dtype": null,
   "seed": 42,
   "tokenizer": "tokenizer/akshara-bpe",
-  "qk_norm": true
+  "qk_norm": true,
+  "gdn_impl": "native"
 }

@@ -22,7 +22,7 @@ from scripts.pretrain import decay_start, unwrap, wsd_lr  # noqa: E402
 from src.models.hybrid_decoder import HybridDecoder  # noqa: E402
 
 TINY = dict(vocab_size=49152, n_embed=64, n_heads=2, n_kv_heads=1, n_layers=4,
-            max_seq_len=32, attn_every=4, use_fla=False, qk_norm=True)
+            max_seq_len=32, attn_every=4, use_fla=False, qk_norm=True, gdn_impl="native")
 
 
 def test_wsd_schedule():
@@ -38,6 +38,15 @@ def test_unwrap_strips_compile_prefix():
     m = HybridDecoder(**TINY)
     keys = set(unwrap(torch.compile(m)).state_dict())             # compile is lazy: no compilation here
     assert keys == set(m.state_dict()) and not any(k.startswith("_orig_mod.") for k in keys)
+
+
+def test_checkpoint_loads_into_longer_context():
+    """RoPE tables are not saved, so 2k weights load into a 16k / higher-theta model."""
+    sd = HybridDecoder(**TINY).state_dict()
+    assert not any(k.startswith("freqs_") for k in sd)
+    long = HybridDecoder(**dict(TINY, max_seq_len=256, rope_theta=1e6))
+    long.load_state_dict(sd)
+    assert long.freqs_cos.shape[0] == 256 * 4
 
 
 def test_chunked_ce_matches_full():

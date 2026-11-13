@@ -73,6 +73,8 @@ def load(ckpt_path, device):
         max_seq_len=c["max_seq_len"], attn_every=c["attn_every"],
         use_fla=c.get("use_fla", False),
         qk_norm=c.get("qk_norm", False),
+        gdn_impl=c.get("gdn_impl", "fla_layer"),
+        rope_theta=c.get("rope_theta", 10000.0),
     )
     model.load_state_dict(ck["model_state_dict"])
     model.to(device).eval()
