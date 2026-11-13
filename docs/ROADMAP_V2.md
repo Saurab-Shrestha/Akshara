@@ -73,10 +73,13 @@ characters, not documents (one Wikipedia article ≠ one forum post).
 | Source | Share | Note |
 |---|---|---|
 | FineWeb-2 `npi_Deva` (Nepali) | 30% | may run dry first — the script warns |
-| FineWeb-2 `hin_Deva` (Hindi) | 25% | |
-| FineWeb-2 `mar_Deva` / `san_Deva` | 4% / 1% | |
-| FineWeb-Edu (English, EduScore ≥ 3) | 30% | |
-| FineMath `finemath-4plus` | 3% | digits, equations, step-by-step text |
+| FineWeb-2 `hin_Deva` (Hindi) | 20% | bridge language for ne/mai/bho/awa |
+| FineWeb-2 `mar_Deva` / `san_Deva` | 3% / 1% | |
+| FineWeb-Edu (English, EduScore ≥ 3) | 24% | |
+| **Code**: codeparrot-clean, permissive-license Python only | 7% | code improves natural-language reasoning (Aryabumi et al. 2024) |
+| FineMath `finemath-4plus` | 4% | digits, equations, step-by-step text |
+| **Reasoning**: Cosmopedia v2 (synthetic textbooks) | 3% | explanatory, step-by-step prose |
+| **Parallel**: BPCC seed en↔ne/mai/sat + OPUS-100 en↔ne | 1% | 16 pairs per doc, alternating direction; links concepts across languages |
 | Wikipedia ne / hi / en | 3% / 2% / 2% | curated |
 
 Validation = 1 doc in 200, chosen by a CRC32 hash of the text (deterministic,
