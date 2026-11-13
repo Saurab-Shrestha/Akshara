@@ -63,6 +63,7 @@ import hashlib
 import json
 import os
 import random
+import shutil
 import time
 import zlib
 
@@ -387,13 +388,25 @@ def prepare_corpus(total_chars: float, out_dir: str, quality: int,
     jobs += extra
     assert abs(sum(j[3] for j in jobs) - 1.0) < 1e-9
 
+    # Each budgeted source is written to its own part file with a .done marker,
+    # so a rerun after a crash or a network hang (HF streams can block forever in
+    # an SSL read; build_corpus.sh kills and reruns on a stall) skips finished
+    # sources and restarts only the interrupted one. Streams are deterministic,
+    # so a restarted source yields the same documents.
+    parts = os.path.join(out_dir, "parts")
+    os.makedirs(parts, exist_ok=True)
     stats = {}
-    with open(os.path.join(out_dir, "train.jsonl"), "w", encoding="utf-8") as ftr, \
-         open(os.path.join(out_dir, "val.jsonl"), "w", encoding="utf-8") as fva:
-        for label, kind, arg, share, lang, nc in jobs:
-            budget = int(total_chars * share)
-            got, docs, t0 = 0, 0, time.time()
-            print(f"[{label}] target {budget/1e6:,.0f}M chars")
+    for label, kind, arg, share, lang, nc in jobs:
+        stem = os.path.join(parts, label.replace("/", "__"))
+        if os.path.exists(stem + ".done"):
+            stats[label] = tuple(json.load(open(stem + ".done")))
+            print(f"[{label}] done earlier: {stats[label][1]/1e6:,.0f}M chars")
+            continue
+        budget = int(total_chars * share)
+        got, docs, t0 = 0, 0, time.time()
+        print(f"[{label}] target {budget/1e6:,.0f}M chars")
+        with open(stem + ".train", "w", encoding="utf-8") as ftr, \
+             open(stem + ".val", "w", encoding="utf-8") as fva:
             try:
                 for text in stream_texts(kind, arg, quality):
                     (fva if is_val(text) else ftr).write(_row(text, lang, nc))
@@ -405,9 +418,21 @@ def prepare_corpus(total_chars: float, out_dir: str, quality: int,
                         break
             except Exception as e:
                 print(f"    [warn] {label} failed after {docs:,} docs: {e}")
-            if got < budget:
-                print(f"    [warn] {label} exhausted at {got/1e6:,.0f}M / {budget/1e6:,.0f}M chars")
-            stats[label] = (docs, got)
+        if got < budget:
+            print(f"    [warn] {label} exhausted at {got/1e6:,.0f}M / {budget/1e6:,.0f}M chars")
+        stats[label] = (docs, got)
+        json.dump([docs, got], open(stem + ".done", "w"))
+
+    mstem = os.path.join(parts, "minority")
+    if minority and os.path.exists(mstem + ".done"):
+        stats.update({k: tuple(v) for k, v in json.load(open(mstem + ".done")).items()})
+        print("[minority] done earlier")
+        minority = False
+    with open(mstem + ".train", "a", encoding="utf-8") as ftr, \
+         open(mstem + ".val", "a", encoding="utf-8") as fva:
+        if minority:   # a crashed earlier attempt may have left a partial part
+            ftr.truncate(0)
+            fva.truncate(0)
 
         # Minority languages: take everything, write val once, then write the
         # train docs in reshuffled passes, so copies of one doc sit ~a whole
@@ -464,6 +489,18 @@ def prepare_corpus(total_chars: float, out_dir: str, quality: int,
                 rng.shuffle(pool)
                 ftr.writelines(_row(t, l, nc) for t, l, b, nc in pool
                                if k < (1 if b else reps[l]))
+            json.dump({k: stats[k] for k in sources}, open(mstem + ".done", "w"))
+
+    # Assemble the parts, deleting each once appended (peak disk = corpus + one part).
+    # ponytail: a crash mid-assembly leaves parts half-deleted; delete out_dir and rebuild.
+    with open(os.path.join(out_dir, "train.jsonl"), "w", encoding="utf-8") as ftr, \
+         open(os.path.join(out_dir, "val.jsonl"), "w", encoding="utf-8") as fva:
+        for stem in [os.path.join(parts, j[0].replace("/", "__")) for j in jobs] + [mstem]:
+            for ext, f in ((".train", ftr), (".val", fva)):
+                with open(stem + ext, encoding="utf-8") as src:
+                    shutil.copyfileobj(src, f, 1 << 24)
+                os.remove(stem + ext)
+    shutil.rmtree(parts)
 
     total = sum(c for _, c in stats.values())
     fmt = lambda n: f"{n/1e9:.2f}B" if n >= 1e9 else f"{n/1e6:,.1f}M"

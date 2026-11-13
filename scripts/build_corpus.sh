@@ -19,7 +19,22 @@ PY=venv/bin/python
 step() { echo; echo "=== $(date '+%F %T') $*"; }
 
 step "1/4 corpus ($TOTAL_CHARS chars) -> $OUT"
-$PY -u scripts/prepare_data.py --total_chars "$TOTAL_CHARS" --out_dir "$OUT" --nepali_share "$NEPALI_SHARE"
+# HF streams can hang forever in an SSL read. prepare_data.py resumes per source,
+# so on a stall (no file under $OUT written for STALL_MIN minutes) kill and rerun.
+STALL_MIN=${STALL_MIN:-15}
+for attempt in $(seq 1 30); do
+    $PY -u scripts/prepare_data.py --total_chars "$TOTAL_CHARS" --out_dir "$OUT" --nepali_share "$NEPALI_SHARE" &
+    pid=$!
+    while kill -0 $pid 2>/dev/null; do
+        sleep 60
+        if [[ -z $(find "$OUT" -type f -mmin -"$STALL_MIN" 2>/dev/null | head -1) ]]; then
+            echo "[watchdog] no output for ${STALL_MIN} min, restarting (attempt $attempt)"
+            kill $pid; sleep 5; kill -9 $pid 2>/dev/null || true
+        fi
+    done
+    if wait $pid; then break; fi
+    [[ $attempt == 30 ]] && { echo "[watchdog] giving up"; exit 1; }
+done
 
 # The tokenizer is committed and every checkpoint depends on its ids, so it is
 # only retrained when missing or when RETRAIN_TOKENIZER=1.
