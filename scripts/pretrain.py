@@ -357,6 +357,15 @@ def main() -> None:
         for g in optimizer.param_groups:
             g["lr"] = lr
 
+        # Keep the last pre-decay weights: resuming from them with a larger
+        # train_steps continues the flat phase on more data, then decays again.
+        # Step in the name: an extended run decays later and gets its own file.
+        predecay = f"{os.path.splitext(cfg.out_ckpt)[0]}_predecay_{step}.pt"
+        if (cfg.schedule == "wsd" and step == decay_start(cfg.warmup_steps, cfg.train_steps, cfg.decay_frac)
+                and not os.path.exists(predecay)):
+            save_checkpoint(predecay, raw_model, optimizer, step, cfg, scaler)
+            print(f"  [ckpt] pre-decay checkpoint → {predecay} (step {step})")
+
         if (path := data_path_at(step, cfg)) != cur_path:
             print(f"[pretrain] step {step}: LR decay starts, switching data {cur_path} → {path}")
             cur_path = path

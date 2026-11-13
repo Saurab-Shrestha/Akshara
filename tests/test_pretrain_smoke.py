@@ -109,6 +109,8 @@ def test_pretrain_runs_switches_to_anneal_and_resumes(tmp_path):
 
     ck = torch.load(ckpt, map_location="cpu", weights_only=False)
     assert ck["step"] == 12
+    pre = torch.load(tmp_path / "ck_predecay_9.pt", map_location="cpu", weights_only=False)
+    assert pre["step"] == 9                                        # = decay start, before any decay step
     HybridDecoder(**TINY).load_state_dict(ck["model_state_dict"])  # plain keys, loads strictly
 
     # resume past the decay start: must begin on the anneal data straight away

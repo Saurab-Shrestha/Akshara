@@ -169,7 +169,10 @@ PYTHONPATH=. python scripts/tokenize_corpus.py --input data/corpus_anneal/train.
 ```
 
 Because the flat phase doesn't depend on the run length, `train_steps` can be
-raised mid-run when more compute appears; only the decay start moves.
+raised mid-run when more compute appears; only the decay start moves. When the
+decay starts, the weights are also saved as `pretrain_v2_predecay_<step>.pt` (and
+pushed to HF). To extend a finished run: `--resume` from that file with a larger
+`train_steps` (e.g. a 2nd pass over corpus_v6), and it decays again at the end.
 `PYTHONPATH=. pytest -q tests/` runs the whole loop on CPU in ~15 s (also in CI).
 
 **Compute — read before starting.** 443M params ≈ 6 × 443M = 2.7 GFLOP/token.
