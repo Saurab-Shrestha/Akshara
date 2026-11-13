@@ -24,5 +24,6 @@
   "hf_repo": "Saurab0/akshara-pretrain-v2",
   "schedule": "wsd",
   "decay_frac": 0.15,
-  "anneal_path": "data/corpus_anneal/train.bin"
+  "anneal_path": "data/corpus_anneal/train.bin",
+  "ce_chunk": 8192
 }

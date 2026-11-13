@@ -40,6 +40,22 @@ def test_unwrap_strips_compile_prefix():
     assert keys == set(m.state_dict()) and not any(k.startswith("_orig_mod.") for k in keys)
 
 
+def test_chunked_ce_matches_full():
+    torch.manual_seed(0)
+    m = HybridDecoder(**dict(TINY, vocab_size=1000))
+    ids, t = torch.randint(0, 1000, (2, 32)), torch.randint(0, 1000, (2, 32))
+    t[0, -5:] = -100
+    _, full = m(ids, t)
+    full.backward()
+    g_full = [p.grad.clone() for p in m.parameters()]
+    m.zero_grad()
+    m.ce_chunk = 20                                               # uneven last chunk on purpose
+    logits, chunked = m(ids, t)
+    chunked.backward()
+    assert logits is None and torch.allclose(full, chunked, atol=1e-6)
+    assert all(torch.allclose(a, p.grad, atol=1e-6) for a, p in zip(g_full, m.parameters()))
+
+
 def _bin(path: Path, n_tokens: int, seed: int):
     rng = np.random.default_rng(seed)
     rng.integers(16, 2000, n_tokens, dtype=np.uint16).tofile(path)
@@ -55,7 +71,7 @@ def test_pretrain_runs_switches_to_anneal_and_resumes(tmp_path):
                batch_size=2, grad_accum=1, train_steps=12, warmup_steps=2,
                schedule="wsd", decay_frac=0.25, optimizer="muon", lr=1e-3, min_lr=1e-4,
                eval_steps=6, eval_iters=1, save_every=6, use_amp=False,
-               use_gradient_checkpointing=False, compile=False,
+               use_gradient_checkpointing=False, compile=False, ce_chunk=16,
                out_ckpt=str(ckpt), log_dir=str(tmp_path / "logs"), hf_repo=None)
     (tmp_path / "cfg.json").write_text(json.dumps(cfg))
 

@@ -139,6 +139,7 @@ class PretrainConfig(ModelConfig):
     use_amp: bool = True
     amp_dtype: Optional[str] = "bf16"          # "bf16" or "fp16"; None = disabled
     use_gradient_checkpointing: bool = True     # recomputes activations in backward
+    ce_chunk: int = 0                           # >0: chunked cross-entropy, tokens per chunk (saves the B×T×V logits)
 
     # Compilation
     compile: bool = False                # torch.compile — fuses GDN loop via Triton

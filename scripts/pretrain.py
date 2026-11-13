@@ -138,9 +138,9 @@ def amp_context(use_amp: bool, amp_dtype: str | None, device: str):
 
     WHY bf16 over fp16:
         bf16 has the same exponent range as fp32, so gradients don't need a
-        GradScaler (which adds code complexity and occasional instability).
-        fp16 is available as a fallback for older GPUs (pre-Ampere) that don't
-        support bf16.
+        GradScaler. fp16 is for pre-Ampere GPUs (Kaggle T4/P100) without fast
+        bf16; there small gradients underflow, so the loop scales the loss
+        with a GradScaler (see main).
     """
     if not use_amp or device == "cpu" or amp_dtype is None:
         return nullcontext()
@@ -176,13 +176,15 @@ def estimate_loss(
     return sum(losses) / max(1, len(losses))
 
 
-def save_checkpoint(path: str, model: nn.Module, optimizer, step: int, cfg: PretrainConfig) -> None:
+def save_checkpoint(path: str, model: nn.Module, optimizer, step: int, cfg: PretrainConfig,
+                    scaler=None) -> None:
     """Save a portable checkpoint dict to ``path``, then optionally push to HF Hub."""
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     torch.save({
         "step": step,
         "model_state_dict": unwrap(model).state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
+        "scaler_state_dict": scaler.state_dict() if scaler is not None else None,
         "config": vars(cfg),
     }, path)
     _push_to_hub(path, cfg, step)
@@ -274,6 +276,7 @@ def main() -> None:
     )
     if cfg.use_gradient_checkpointing:
         model.set_gradient_checkpointing(True)
+    model.ce_chunk = cfg.ce_chunk
     model = model.to(device)
 
     # --- optional resume (before compile / DataParallel so keys match) ---
@@ -291,6 +294,15 @@ def main() -> None:
     optimizer = build_optimizer(model, cfg, device)
     if ck is not None and "optimizer_state_dict" in ck:
         optimizer.load_state_dict(ck["optimizer_state_dict"])
+
+    # fp16 only: scale the loss so small gradients don't underflow to zero; the
+    # scale backs off when a step overflows (that step is skipped). Disabled =
+    # every call below is a pass-through, so bf16/fp32 use the same code path.
+    use_scaler = cfg.use_amp and cfg.amp_dtype == "fp16" and device.startswith("cuda")
+    scaler = torch.amp.GradScaler("cuda", enabled=use_scaler)
+    if use_scaler and ck is not None and ck.get("scaler_state_dict"):
+        scaler.load_state_dict(ck["scaler_state_dict"])
+    opts = getattr(optimizer, "opts", (optimizer,))  # GradScaler needs real torch optimizers
     del ck
 
     if cfg.compile:
@@ -368,11 +380,15 @@ def main() -> None:
                 # DataParallel returns one loss per GPU — reduce to scalar
                 loss = loss.mean() / cfg.grad_accum
 
-            loss.backward()
+            scaler.scale(loss).backward()
             accum_loss += loss.item()
 
+        for o in opts:
+            scaler.unscale_(o)  # clip true gradients, not scaled ones
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
-        optimizer.step()
+        for o in opts:
+            scaler.step(o)      # skipped if the grads hold inf/nan
+        scaler.update()
 
         # --- logging every 20 steps ---
         if step % 20 == 0:
@@ -411,11 +427,11 @@ def main() -> None:
         # --- periodic checkpoint ---
         if step > start_step and step % cfg.save_every == 0:
             # step+1: this step is done — resume should start at the next one
-            save_checkpoint(cfg.out_ckpt, raw_model, optimizer, step + 1, cfg)
+            save_checkpoint(cfg.out_ckpt, raw_model, optimizer, step + 1, cfg, scaler)
             print(f"  [ckpt] saved → {cfg.out_ckpt} (step {step})")
 
     # --- final checkpoint ---
-    save_checkpoint(cfg.out_ckpt, raw_model, optimizer, cfg.train_steps, cfg)
+    save_checkpoint(cfg.out_ckpt, raw_model, optimizer, cfg.train_steps, cfg, scaler)
     writer.close()
     print(f"[pretrain] done. Final checkpoint → {cfg.out_ckpt}")
 

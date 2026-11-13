@@ -69,6 +69,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.utils.checkpoint as ckpt
 
 from src.models.gdn_block import GDNBlock
@@ -142,6 +143,7 @@ class HybridDecoder(nn.Module):
         self.n_embed     = n_embed
         self.max_seq_len = max_seq_len
         self.gradient_checkpointing = False
+        self.ce_chunk = 0  # tokens per loss chunk in training; 0 = full logits (set by pretrain.py)
 
         self.token_embed = nn.Embedding(vocab_size, n_embed)
 
@@ -220,7 +222,25 @@ class HybridDecoder(nn.Module):
             else:
                 x = layer(x, cos, sin)
 
-        x      = self.norm(x)
+        x = self.norm(x)
+
+        # Chunked cross-entropy (Wijmans et al. 2024, "Cut Your Losses"): the full
+        # logits tensor (B×T×49k, fp32 for the loss) dominates activation memory.
+        # Each chunk's logits are recomputed in backward, so only one chunk lives
+        # at a time. Training only; returns logits=None. Opt-in via ce_chunk > 0.
+        if targets is not None and self.training and self.ce_chunk > 0:
+            if vision_prefix is not None:
+                x = x[:, vision_prefix.shape[1]:]
+            h, t = x.reshape(-1, x.shape[-1]), targets.reshape(-1).long()
+
+            def _chunk_loss(hc, tc):
+                return F.cross_entropy(self.lm_head(hc).float(), tc, ignore_index=-100, reduction="sum")
+
+            total = sum(ckpt.checkpoint(_chunk_loss, h[i:i + self.ce_chunk], t[i:i + self.ce_chunk],
+                                        use_reentrant=False)
+                        for i in range(0, h.shape[0], self.ce_chunk))
+            return None, total / (t != -100).sum().clamp(min=1)
+
         logits = self.lm_head(x)
 
         loss = None

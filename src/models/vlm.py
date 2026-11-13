@@ -143,7 +143,8 @@ class Akshara(nn.Module):
         # logits shape from decoder: (B, n_patches + T, vocab_size)
         # Slice to text portion only — callers only care about text predictions
         n_visual = visual_prefix.shape[1]
-        logits   = logits[:, n_visual:, :]   # (B, T, vocab_size)
+        if logits is not None:               # None when the decoder used chunked CE
+            logits = logits[:, n_visual:, :]   # (B, T, vocab_size)
 
         return logits, loss
 
