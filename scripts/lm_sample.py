@@ -14,6 +14,7 @@ import torch
 from transformers import AutoTokenizer
 
 from src.models.hybrid_decoder import HybridDecoder
+from src.checkpoint import load_checkpoint
 
 PROMPTS = [
     "नेपालको राजधानी",
@@ -25,17 +26,22 @@ PROMPTS = [
 
 
 def load(ckpt_path, device):
-    ck = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    ck = load_checkpoint(ckpt_path)
     c = ck["config"]
     model = HybridDecoder(
         vocab_size=c["vocab_size"], n_embed=c["n_embed"], n_heads=c["n_heads"],
         n_kv_heads=c["n_kv_heads"], n_layers=c["n_layers"],
         max_seq_len=c["max_seq_len"], attn_every=c["attn_every"],
         use_fla=c.get("use_fla", False),
+        qk_norm=c.get("qk_norm", False),
+        gdn_impl=c.get("gdn_impl", "fla_layer"),
+        rope_theta=c.get("rope_theta", 10000.0),
     )
     model.load_state_dict(ck["model_state_dict"])
     model.to(device).eval()
-    return model, c["max_seq_len"], ck.get("step")
+    # v1 checkpoints predate the "tokenizer" field → Qwen
+    tok = AutoTokenizer.from_pretrained(c.get("tokenizer", "Qwen/Qwen3.5-0.8B"), trust_remote_code=True)
+    return model, tok, c["max_seq_len"], ck.get("step")
 
 
 @torch.no_grad()
@@ -43,17 +49,9 @@ def generate(model, tok, prompt, device, max_seq_len, max_new=50, temperature=0.
     eos = tok.eos_token_id           # training used EOS as the BOS sentinel
     ids = [eos] + tok.encode(prompt)
     x = torch.tensor([ids], device=device)
-    for _ in range(max_new):
-        logits, _ = model(x[:, -max_seq_len:])
-        logits = logits[0, -1].float() / temperature
-        if top_k:
-            v, _ = torch.topk(logits, top_k)
-            logits[logits < v[-1]] = -float("inf")
-        nxt = torch.multinomial(torch.softmax(logits, -1), 1).item()
-        if nxt == eos:
-            break
-        x = torch.cat([x, torch.tensor([[nxt]], device=device)], dim=1)
-    return tok.decode(x[0, 1:].tolist())
+    max_new = min(max_new, max_seq_len - len(ids))
+    out = model.generate(x, max_new, temperature=temperature, top_k=top_k, eos_token_id=eos)[0, 1:].tolist()
+    return tok.decode(out[: out.index(eos)] if eos in out[len(ids) - 1:] else out)
 
 
 def main():
@@ -64,8 +62,7 @@ def main():
     ap.add_argument("--max_new", type=int, default=50)
     a = ap.parse_args()
 
-    tok = AutoTokenizer.from_pretrained("Qwen/Qwen3.5-0.8B", trust_remote_code=True)
-    model, max_seq_len, step = load(a.ckpt, a.device)
+    model, tok, max_seq_len, step = load(a.ckpt, a.device)
     print(f"[lm_sample] loaded {a.ckpt} (step {step}) | device={a.device}\n")
     for p in PROMPTS:
         out = generate(model, tok, p, a.device, max_seq_len,

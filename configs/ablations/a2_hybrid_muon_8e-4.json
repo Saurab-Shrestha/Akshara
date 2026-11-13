@@ -1,0 +1,7 @@
+{
+  "_comment": "LR sweep. Muon uses match_rms_adamw, so lr is on the AdamW scale.",
+  "lr": 0.0008,
+  "min_lr": 8e-05,
+  "out_ckpt": "checkpoints/ablations/a2_hybrid_muon_8e-4.pt",
+  "log_dir": "logs/ablations/a2_hybrid_muon_8e-4"
+}

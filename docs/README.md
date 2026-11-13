@@ -2,9 +2,13 @@
 
 A step-by-step, build-from-scratch tutorial for the model's components.
 
-> **⚠️ This tutorial series predates two big changes.** The canonical, current
-> design is **[ARCHITECTURE.md](ARCHITECTURE.md)** (+ **[OCR_FINETUNE_PLAN.md](OCR_FINETUNE_PLAN.md)**) — read those first.
-> Two shifts happened after these notes were written:
+> **v2 (2026-11): Akshara is now a from-scratch multimodal LLM.** Start with
+> **[ROADMAP_V2.md](ROADMAP_V2.md)**: own 48k tokenizer, 443M decoder, Muon,
+> QK-norm, 3B+ token pretrain, then vision alignment and instruction tuning.
+> Then read [ARCHITECTURE.md](ARCHITECTURE.md). Chapters 02 and 04 are updated
+> for v2; 07 and 10 carry v2 notes (their mechanics hold, their numbers are v1).
+>
+> Earlier shifts that also postdate these notes:
 > 1. **Vision encoder** is now **pretrained DINOv2-S/14 at 448px** (1024 patches), not a from-scratch ViT-S/16.
 > 2. **Full-page OCR → crop recognition**: Surya finds structure, we only read crops. So `11_detection.md` is **superseded**.
 >
@@ -14,8 +18,9 @@ A step-by-step, build-from-scratch tutorial for the model's components.
 
 ## What we're building
 
-A **~308M parameter hybrid VLM** that reads Devanagari + English document
-*crops* and outputs Unicode text:
+A **~466M parameter multimodal LLM** (443M decoder + 22M vision) that reads
+Devanagari + English documents and answers about images. The diagram shows the
+crop-reading path; numbers are v2:
 
 ```
 Crop image (448×448)
@@ -28,21 +33,21 @@ Crop image (448×448)
             │ patch tokens (1024 × 384)
             ▼
  ┌─────────────────────┐
- │  Connector          │  2-layer MLP + RMSNorm — 384 → 768
+ │  Connector          │  2-layer MLP + RMSNorm — 384 → 1024
  │  (~0.9M params)     │
  └──────────┬──────────┘
             │ visual prefix
             ▼
  ┌─────────────────────┐
- │  Hybrid Decoder     │  16 layers, 3:1 GDN + Attention (FLA on GPU),
- │  (~308M params)     │  generates Devanagari/Latin text autoregressively
+ │  Hybrid Decoder     │  32 layers × 1024, 3:1 GDN + Attention (FLA on GPU),
+ │  (~443M params)     │  own 48k vocab, QK-norm, generates text
  └──────────┬──────────┘
             │
             ▼
     "नेपाल राम्रो देश हो"
 ```
 
-**Status:** Stage 1 language pretrain ✅ done — prior on HF (`Saurab0/akshara-pretrain`).
+**Status:** v1 pretrain ✅ done (`Saurab0/akshara-pretrain`). v2 code for stages 0–3 is ready, and the v2 pretrain run is next.
 
 ---
 
@@ -70,7 +75,7 @@ documents), 25% are exact attention (ensures verbatim character recall for OCR).
 ### Foundations (read these first)
 | Doc | Covers |
 |---|---|
-| [Tokenization](foundations/tokenization.md) | BPE, Devanagari Unicode, why we use Qwen3.5 tokenizer |
+| [Tokenization](foundations/tokenization.md) | BPE, Devanagari Unicode (v1 Qwen rationale; see 02 for v2) |
 | [Attention](foundations/attention.md) | Self-attention, causal masking, multi-head, GQA |
 | [Transformer](foundations/transformer.md) | Residual connections, pre-norm, training loop |
 | [Gated DeltaNet](foundations/gdn.md) | Linear attention, delta rule, gating — the key innovation |
@@ -79,9 +84,9 @@ documents), 25% are exact attention (ensures verbatim character recall for OCR).
 | Doc | What we build | Files |
 |---|---|---|
 | [01 · Setup](01_setup.md) | Project structure, venv, dependencies | `requirements.txt`, `tokenizer/verify.py` |
-| [02 · Tokenizer](02_tokenizer.md) | Qwen3.5 tokenizer verification for Nepali | `tokenizer/verify.py` |
+| [02 · Tokenizer](02_tokenizer.md) | **v2:** training our own 48k byte-level BPE | `scripts/train_tokenizer.py` |
 | [03 · Building Blocks](03_building_blocks.md) | RMSNorm, RoPE, SwiGLU | `src/models/rms_norm.py`, `rope.py`, `swiglu.py` |
-| [04 · Attention](04_attention.md) | Multi-head attention + GQA + causal mask | `src/models/attention.py` |
+| [04 · Attention](04_attention.md) | Multi-head attention + GQA + causal mask + **v2 QK-norm/SDPA** | `src/models/attention.py` |
 | [05 · Transformer Block](05_transformer_block.md) | One full standard layer | `src/models/transformer_block.py` |
 | [06 · GDN Block](06_gdn_block.md) | Gated DeltaNet recurrent layer | `src/models/gdn_block.py` |
 | [07 · Hybrid Decoder](07_hybrid_decoder.md) | 3:1 hybrid — the full text model | `src/models/hybrid_decoder.py` |
@@ -90,8 +95,9 @@ documents), 25% are exact attention (ensures verbatim character recall for OCR).
 | [10 · Full VLM](10_vlm.md) | Assembled end-to-end model | `src/models/vlm.py` |
 | ~~11 · Detection~~ | **superseded** — full-page detection was replaced by Surya + crop recognition (see [ARCHITECTURE.md](ARCHITECTURE.md)) | — |
 
-Current design, curriculum, data strategy, and training/infra all live in
-**[ARCHITECTURE.md](ARCHITECTURE.md)** and **[OCR_FINETUNE_PLAN.md](OCR_FINETUNE_PLAN.md)**.
+Current plan: **[ROADMAP_V2.md](ROADMAP_V2.md)**. Design and infra:
+**[ARCHITECTURE.md](ARCHITECTURE.md)**. OCR data plan (stage 5):
+**[OCR_FINETUNE_PLAN.md](OCR_FINETUNE_PLAN.md)**.
 
 ---
 

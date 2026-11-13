@@ -32,6 +32,7 @@ from PIL import Image
 
 from src.data.ocr_dataset import pad_to_square, _IMAGENET_MEAN, _IMAGENET_STD
 from src.models.vlm import Akshara
+from src.checkpoint import load_checkpoint
 
 # Surya layout labels → HTML tags. Unlisted labels (PageFooter, Picture…) are skipped.
 _TAG = {
@@ -50,14 +51,14 @@ class AksharaPipeline:
         self.device     = device
         self.batch_size = batch_size
 
-        ck  = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        ck  = load_checkpoint(ckpt_path)
         cfg = ck.get("config")
         if cfg is None:
             raise ValueError(f"{ckpt_path} has no embedded config — cannot build model")
 
         model_keys = ("img_size", "patch_size", "vision_dim", "vit_layers", "vit_heads",
                       "vocab_size", "n_embed", "n_heads", "n_kv_heads", "n_layers",
-                      "max_seq_len", "attn_every")
+                      "max_seq_len", "attn_every", "qk_norm", "gdn_impl", "rope_theta")
         # vit_pretrained=False: weights come from the checkpoint — no need to
         # download DINOv2 just to overwrite it
         self.model = Akshara(**{k: cfg[k] for k in model_keys if k in cfg},
@@ -67,7 +68,7 @@ class AksharaPipeline:
         self.img_size = cfg.get("img_size", 448)
 
         from transformers import AutoTokenizer
-        self.tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3.5-0.8B")
+        self.tokenizer = AutoTokenizer.from_pretrained(cfg.get("tokenizer", "Qwen/Qwen3.5-0.8B"))
 
         self._layout    = None  # lazy — loaded on first .process()
         self._table_rec = None

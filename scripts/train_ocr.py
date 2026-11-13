@@ -53,8 +53,10 @@ import torch.nn as nn
 
 from config.config import OCRFinetuneConfig
 from config.loader import load_config
+from src.optim import build_optimizer
 from src.data.ocr_dataset import get_ocr_dataloader
 from src.models.vlm import Akshara
+from src.checkpoint import load_checkpoint
 
 
 # ---------------------------------------------------------------------------
@@ -214,6 +216,7 @@ def main() -> None:
     parser.add_argument("--out_ckpt",    type=str,   default=None)
     parser.add_argument("--seed",        type=int,   default=None)
     parser.add_argument("--device",      type=str,   default=None)
+    parser.add_argument("--tokenizer",   type=str,   default=None)
     args = parser.parse_args()
 
     overrides = {k: v for k, v in vars(args).items()
@@ -229,7 +232,7 @@ def main() -> None:
 
     # --- tokenizer ---
     from transformers import AutoTokenizer
-    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3.5-0.8B", trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(cfg.tokenizer, trust_remote_code=True)
 
     # --- model ---
     model = Akshara(
@@ -247,6 +250,9 @@ def main() -> None:
         vit_heads=cfg.vit_heads,
         vit_pretrained=cfg.vit_pretrained,
         use_fla=cfg.use_fla,
+        qk_norm=cfg.qk_norm,
+        gdn_impl=cfg.gdn_impl,
+        rope_theta=cfg.rope_theta,
     )
     if cfg.use_gradient_checkpointing:
         model.set_gradient_checkpointing(True)
@@ -254,7 +260,7 @@ def main() -> None:
     # --- warm-start decoder from pretrain checkpoint ---
     pretrain_ckpt = cfg.pretrain_ckpt
     if pretrain_ckpt and os.path.exists(pretrain_ckpt):
-        ck = torch.load(pretrain_ckpt, map_location="cpu", weights_only=False)
+        ck = load_checkpoint(pretrain_ckpt)
         # Load only the decoder weights; vision encoder keeps its DINOv2 init.
         model.decoder.load_state_dict(ck["model_state_dict"], strict=True)
         print(f"[train_ocr] loaded decoder weights from {pretrain_ckpt}")
@@ -268,21 +274,16 @@ def main() -> None:
     # --- optional resume (load before DataParallel so keys match) ---
     start_step = 0
     if args.resume and os.path.exists(args.resume):
-        ck = torch.load(args.resume, map_location="cpu", weights_only=False)
+        ck = load_checkpoint(args.resume)
         model.load_state_dict(ck["model_state_dict"])
         start_step = ck.get("step", 0)
         print(f"[train_ocr] resumed from {args.resume} at step {start_step}")
 
     # --- optimizer ---
-    decay_params   = [p for n, p in model.named_parameters() if p.requires_grad and p.dim() >= 2]
-    nodecay_params = [p for n, p in model.named_parameters() if p.requires_grad and p.dim() < 2]
-    optimizer = torch.optim.AdamW([
-        {"params": decay_params,   "weight_decay": cfg.weight_decay},
-        {"params": nodecay_params, "weight_decay": 0.0},
-    ], lr=cfg.lr, betas=(0.9, 0.95), fused=(device == "cuda" and torch.cuda.is_available()))
+    optimizer = build_optimizer(model, cfg, device)
 
     if args.resume and os.path.exists(args.resume):
-        ck = torch.load(args.resume, map_location="cpu", weights_only=False)
+        ck = load_checkpoint(args.resume)
         if "optimizer_state_dict" in ck:
             optimizer.load_state_dict(ck["optimizer_state_dict"])
 

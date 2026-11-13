@@ -135,12 +135,13 @@ for t in range(T):
 
 This is **correct** but **slow** — Python loop overhead is high for long sequences.
 
-On Kaggle T4 (CUDA): swap `GatedDeltaNetLayer` with `fla.layers.GatedDeltaNet`
-from [fla-org/flash-linear-attention](https://github.com/fla-org/flash-linear-attention).
-Their Triton kernel fuses all T steps into one GPU pass — same math, 10–50× faster.
-
-The swap is one import change. Our pure-PyTorch version is for understanding
-and for Mac/CPU development (Triton requires CUDA).
+On CUDA with `use_fla: true`, the same q, k, v, β, α go to
+`chunk_gated_delta_rule` from [fla-org/flash-linear-attention](https://github.com/fla-org/flash-linear-attention).
+Its Triton kernel processes the sequence in chunks in one GPU pass — same
+math, same weights, 10–50× faster. The pure-PyTorch loop is kept for
+understanding, for Mac/CPU, and for decoding one token at a time. (The real
+code applies the forget gate before the delta rule, matching FLA: see
+`recurrent_gated_delta_rule` in `src/models/gdn_block.py`.)
 
 ---
 

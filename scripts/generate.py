@@ -49,6 +49,7 @@ import torch
 from PIL import Image
 
 from src.data.ocr_dataset import pad_to_square
+from src.checkpoint import load_checkpoint
 
 # ImageNet normalisation — must match the training preprocessing in ocr_dataset.py.
 _IMAGENET_MEAN = [0.485, 0.456, 0.406]
@@ -155,7 +156,7 @@ def main() -> None:
         sys.exit(1)
 
     # --- load checkpoint ---
-    ck = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+    ck = load_checkpoint(args.checkpoint)
     saved_config = ck.get("config", {})
 
     device = args.device or saved_config.get("device", "cpu")
@@ -179,6 +180,9 @@ def main() -> None:
         vision_dim  = saved_config.get("vision_dim",  384),
         vit_layers  = saved_config.get("vit_layers",  12),
         vit_heads   = saved_config.get("vit_heads",   6),
+        qk_norm     = saved_config.get("qk_norm",     False),
+        gdn_impl    = saved_config.get("gdn_impl",    "fla_layer"),
+        rope_theta  = saved_config.get("rope_theta",  10000.0),
         vit_pretrained = False,  # weights come from the checkpoint
     )
     model.load_state_dict(ck["model_state_dict"])
@@ -189,7 +193,8 @@ def main() -> None:
 
     # --- tokenizer ---
     from transformers import AutoTokenizer
-    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3.5-0.8B", trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(
+        saved_config.get("tokenizer", "Qwen/Qwen3.5-0.8B"), trust_remote_code=True)
 
     # --- preprocess + decode ---
     image_tensor = preprocess_image(args.image, img_size).to(device)

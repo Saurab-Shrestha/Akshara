@@ -1,0 +1,5 @@
+{
+  "_comment": "Baseline: the v2 recipe at proxy scale.",
+  "out_ckpt": "checkpoints/ablations/a1_hybrid_muon_4e-4.pt",
+  "log_dir": "logs/ablations/a1_hybrid_muon_4e-4"
+}

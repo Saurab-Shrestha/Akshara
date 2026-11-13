@@ -1,0 +1,6 @@
+{
+  "_comment": "Optimizer fallback: plain AdamW (0.9/0.95, wd 0.1) at the best LR from a1-a3 (pass --lr/--min_lr).",
+  "optimizer": "adamw",
+  "out_ckpt": "checkpoints/ablations/a5_hybrid_adamw.pt",
+  "log_dir": "logs/ablations/a5_hybrid_adamw"
+}

@@ -8,7 +8,8 @@
   "eval_steps": 5,
   "eval_iters": 2,
   "warmup_steps": 2,
-  "lr": 1e-3,
+  "lr": 0.001,
   "out_ckpt": "/tmp/smoke_ocr.pt",
-  "log_dir": "/tmp/smoke_logs"
+  "log_dir": "/tmp/smoke_logs",
+  "optimizer": "muon"
 }

@@ -154,18 +154,21 @@ the sequential loop is higher (holding S). Triton kernel would hide this cost.
 | Implementation | Correctness | Speed (T=512) | Platforms |
 |---|---|---|---|
 | This PyTorch loop | ✅ | ~100ms | Any |
-| fla `GatedDeltaNet` | ✅ | ~2ms | CUDA only |
+| fla `chunk_gated_delta_rule` kernel | ✅ | ~2ms | CUDA only |
 
-On Kaggle T4, swap `GatedDeltaNetLayer` with:
+Both run on **the same weights** (v2, `gdn_impl: "native"`). The layer computes
+q, k, v, β and the forget gate g = log α with its own projections, then hands
+them to FLA's chunked kernel on CUDA (`use_fla: true`) or to
+`recurrent_gated_delta_rule` elsewhere. The PyTorch loop follows FLA's naive
+reference exactly — decay first, then the delta rule, q and k L2-normalised,
+q scaled by 1/√d — and `tests/test_inference.py` checks it against that
+reference. So a model trained on a GPU loads and decodes on a Mac.
 
-```python
-from fla.layers import GatedDeltaNet
-# inside GDNBlock, replace self.gdn = GatedDeltaNetLayer(...)
-# with    self.gdn = GatedDeltaNet(d_model=n_embed, num_heads=n_heads)
-```
+For decoding, the layer also returns its memory S (B, H, K, V): generation
+carries S forward one token at a time instead of re-reading the prefix.
 
-The interface is not identical — check fla's API for exact argument names.
-But the mathematical operation is the same.
+v1 checkpoints (`gdn_impl: "fla_layer"`) used FLA's whole `GatedDeltaNet`
+module, which has different weights; they still load, but only with FLA on CUDA.
 
 ---
 

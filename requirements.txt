@@ -30,3 +30,6 @@ ipykernel>=6.29.0
 # than the pure-Python recurrence in gdn_block.py.  Install on Kaggle T4:
 #   pip install flash-linear-attention
 # fla>=1.0.0
+
+# Optional: experiment tracking (pretrain.py --wandb_project)
+# wandb>=0.17

@@ -1,104 +1,175 @@
 # 02 · Tokenizer
 
-Choosing and verifying a tokenizer that handles Devanagari correctly.
+Training our own byte-level BPE tokenizer for Devanagari + English (v2).
 
 ---
 
-## Why not train our own?
+## Why v1 borrowed one, and why v2 trains its own
 
-Training a good BPE tokenizer requires a large, clean corpus. Nepali Wikipedia
-has ~100k articles — decent but small. A tokenizer trained on that alone would
-have weak coverage of technical vocabulary, code-switched text (Nepali + English
-in the same document), and formal register.
+v1 used the **Qwen3.5-0.8B** tokenizer (248k tokens). The reasoning made sense
+at the time: a huge multilingual tokenizer had already solved coverage. Then
+we measured what it cost a ~110M-param model:
 
-Qwen3.5-0.8B was trained on a 36T-token corpus including multiple Indian
-subcontinent languages. Its tokenizer has already solved the coverage problem.
+| | Qwen3.5 248k | **akshara-bpe 48k** |
+|---|---|---|
+| Nepali chars/token (held-out) | 1.44 | **4.60** |
+| English chars/token | 4.32 | 4.08 |
+| Embedding params (dim 1024) | 254M | **50M** |
+| Output-head FLOPs/token (fwd+bwd) | ~1.5 GFLOP | ~0.3 GFLOP |
 
-**The rule:** use the best existing tool rather than building from scratch if
-the license allows. Qwen3.5-0.8B tokenizer is Apache-2.0 — free to use and
-modify commercially.
+Qwen's vocabulary is spread across ~100 languages. Only a small slice of it
+is Devanagari, so Nepali is split into short pieces and every sentence costs
+2.4× more tokens. Meanwhile the 248k-row embedding and output head took most
+of the parameters and most of the compute. A tokenizer trained on *our*
+languages fixes both, and building it is a lesson in its own right.
+
+### 32k vs 48k (2026-11-12, preliminary test corpus)
+
+| Lang | 32k | **48k** | Qwen 248k |
+|---|---|---|---|
+| English | 3.87 | **4.08** | 4.32 |
+| Nepali | 4.35 | **4.60** | 1.44 |
+| Hindi | 3.72 | **3.87** | 1.56 |
+| Maithili | 3.51 | **3.69** | 1.45 |
+| Bhojpuri | 3.49 | **3.67** | 1.54 |
+| Newari | 3.82 | **3.89** | 1.33 |
+| Santali (Ol Chiki) | 2.76 | **3.02** | 0.45 |
+| Tamang / Tharu / Sherpa / Sunwar | 2.4–2.9 | **2.7–3.2** | ~1.4 |
+
+48k wins on every language by 4–11%. It adds 17M embedding params (+4%)
+and ~4% compute per token, but needs ~5% fewer tokens for the same text, so
+the compute per character is about the same and the context holds more text.
+### Per-language floor (2026-11-12, full test corpus with all sources)
+
+A flat oversampling factor can't help a language with 5M chars in a 2 GB
+sample. Limbu reached only 1.92 chars/token. `--floor` guarantees every
+minority language a minimum share of the tokenizer sample (default 1.5% of the
+main-language sample, or all of its text if it has less):
+
+| Lang | No floor | **Floor 1.5%** | Qwen 248k |
+|---|---|---|---|
+| Limbu | 1.92 | **3.37** | 0.56 |
+| Sherpa | 2.63 | **4.13** | 1.41 |
+| Tamang | 3.20 | **4.09** | 1.31 |
+| Sunwar | 3.22 | **3.66** | 1.26 |
+| Tharu | 2.80 | **3.13** | 1.47 |
+| Awadhi / Doteli | 3.27 / 3.43 | **3.43 / 3.59** | ~1.4 |
+| Maithili / Bhojpuri / Newari | 3.47 / 3.42 / 3.32 | 3.46 / 3.43 / 3.26 | ~1.4 |
+| Santali (Ol Chiki) | 2.97 | 2.91 | 0.43 |
+| Nepali / Hindi / English | 4.60 / 3.86 / 4.08 | 4.54 / 3.82 / 4.01 | 1.44 / 1.56 / 4.32 |
+
+The cost is about −1.5% on the main languages. Small-language gains are probably
+inflated: their text is mostly Bible translation and they have only 2–6 held-out docs.
+
+**v2 uses 48k (49,152) with the 1.5% floor.**
+
+### Final tokenizer (2026-11-13, full `corpus_v5`, 1 GB sample)
+
+| Lang | **akshara 48k** | Qwen 248k |
+|---|---|---|
+| Nepali | **4.59** | 1.45 |
+| Hindi / Marathi | **3.86 / 3.71** | 1.61 / 1.44 |
+| English | 4.21 | 4.56 |
+| Code (Python) | 3.38 | 3.87 |
+| Maithili / Bhojpuri / Newari | **3.51 / 3.43 / 3.38** | ~1.4 |
+| Santali (Ol Chiki) | **3.08** | 0.43 |
+| Limbu / Sunwar / Tamang / Sherpa | **3.19 / 3.51 / 3.88 / 3.85** | 0.56 / 1.26 / 1.31 / 1.41 |
+| en↔ne parallel | **3.79** | 2.14 |
+
+English and code are ~8–13% worse than Qwen. That is the price of a vocabulary
+built mostly for Devanagari. Packed corpus: 3.19B train tokens and 15.5M val tokens.
 
 ---
 
-## Devanagari tokenizer requirements
+## Design decisions (`scripts/train_tokenizer.py`)
 
-1. **No byte fallback** — Devanagari characters should map to real subword
-   tokens, not `\xe0\xa4\x95` sequences
-2. **Conjunct merging** — `क` + `्` + `ष` should ideally produce `क्ष` as
-   one token
-3. **Matra merging** — `क` + `ा` → `का` (consonant + vowel sign together)
-4. **Reasonable ratio** — target < 4 tokens/word for Nepali (English is ~1.3)
+**1. Byte-level BPE.** Start from the 256 byte values and repeatedly merge the
+most frequent adjacent pair. Any string is encodable, so there is no `<unk>`.
+A Devanagari character is 3 UTF-8 bytes, and the frequent ones merge into
+single tokens quickly.
+
+**2. NFC normalisation.** Some Devanagari glyphs have two encodings: `क़` can
+be U+0958 or `क` + nukta `़`. NFC maps both to one canonical form, so the
+model doesn't have to learn the same glyph twice.
+
+**3. A pre-tokenizer that respects Devanagari.** BPE never merges across
+pre-tokenizer boundaries. GPT-2/Qwen split with ` ?\p{L}+`, which means
+"letters". Devanagari vowel signs (matras), virama `्` and anusvara are
+`\p{M}` (*marks*), so that regex tears `नेपाल` into `न` `े` `पाल` before BPE
+ever sees it. Our pattern:
+
+```
+ ?[\p{L}\p{M}\x{200C}\x{200D}]+   words incl. marks + ZWNJ/ZWJ (र्‍ half-forms)
+| ?\p{N}{1,3}                     numbers in groups of ≤3 (LLaMA-3 style)
+| ?[^\s\p{L}\p{M}\p{N}]+          punctuation runs (। ॥ . , …)
+|\s+(?!\S)|\s+                    whitespace
+```
+
+**4. Special tokens reserved now.**
+
+| Token | id | Used in |
+|---|---|---|
+| `<|bos|>` / `<|eos|>` / `<|pad|>` | 0 / 1 / 2 | pretraining: every doc is `<|bos|> … <|eos|>` |
+| `<|image|>` | 3 | stage 4–5: placeholder replaced by visual tokens |
+| `<|im_start|>` / `<|im_end|>` | 4 / 5 | stage 5: chat turns |
+| `<|reserved_0..9|>` | 6–15 | future use, no embedding resize needed |
+
+Adding a token after pretraining means resizing the embedding and the new
+row starts untrained. Reserving rows now costs nothing.
+
+**5. Vocab ≤ 65,535.** Token ids then fit in `uint16`, which halves the
+packed corpus on disk (`scripts/tokenize_corpus.py`).
 
 ---
 
-## Verification (`tokenizer/verify.py`)
+## Train it
+
+```bash
+PYTHONPATH=. python scripts/train_tokenizer.py \
+    --input data/corpus_v5/train.jsonl --vocab_size 49152 \
+    --out_dir tokenizer/akshara-bpe --compare Qwen/Qwen3.5-0.8B
+```
+
+- Trains on a uniform random ~2 GB sample. The corpus is written source by
+  source, so taking the first N lines would give an all-Nepali tokenizer.
+- Asserts `decode(encode(x)) == NFC(x)` on 500 held-out docs.
+- Prints chars/token per language. Minority languages are sampled `--boost`×
+  (default 2). Check the printed "training sample by language" shares.
+- Commit `tokenizer/akshara-bpe/`. Every checkpoint depends on these exact ids.
+
+Sample output (100 MB training sample):
+
+```
+['नेपाल', ' राम्रो', ' छ', '।', ' Hell', 'o', ' 202', '6']
+```
+
+Whole words come out as single tokens and the danda is its own token. `Hello`
+is split only because the small sample had little English, so check it again
+on the full corpus.
+
+---
+
+## Using it
 
 ```python
 from transformers import AutoTokenizer
-
-tok = AutoTokenizer.from_pretrained("Qwen/Qwen3.5-0.8B")
-
-# Test Devanagari coverage
-test_words = ["नेपाल", "राम्रो", "देश", "क्षमा", "संविधान"]
-for word in test_words:
-    tokens = tok.tokenize(word)
-    has_byte_fallback = any("\\x" in repr(t) for t in tokens)
-    print(f"{word:12} → {tokens}  {'❌ byte fallback' if has_byte_fallback else '✅'}")
+tok = AutoTokenizer.from_pretrained("tokenizer/akshara-bpe")
+ids = tok.encode("नेपाल एक सुन्दर देश हो।")          # no BOS/EOS added
+tok.decode(ids)
 ```
 
-**Results:**
-```
-नेपाल       → ['ने', 'पाल']                    ✅
-राम्रो      → ['राम', '्रो']                   ✅
-देश         → ['देश']                           ✅  (single token!)
-क्षमा       → ['क्ष', 'मा']                    ✅  (conjunct merged)
-संविधान     → ['सं', 'वि', 'धान']              ✅
-```
-
-No byte fallback anywhere. Average: **3.0 tokens/word** — well within target.
-
----
-
-## Using the tokenizer in training
-
-```python
-tok = AutoTokenizer.from_pretrained("Qwen/Qwen3.5-0.8B")
-
-# Encode a line of OCR ground truth
-text = "नेपाल एक सुन्दर देश हो।"
-ids  = tok.encode(text, return_tensors="pt")  # shape: (1, n_tokens)
-
-# Decode back (for inspection)
-tok.decode(ids[0])  # → 'नेपाल एक सुन्दर देश हो।'
-```
-
-Special tokens:
-- `tok.eos_token_id` — end of sequence (used to signal generation stop)
-- `tok.bos_token_id` — beginning of sequence (prepended before OCR target)
-- `tok.pad_token_id` — padding (for batching variable-length sequences)
-
----
-
-## Vocab size in the model
-
-The tokenizer vocabulary is **248,044 tokens** (Qwen3.5-0.8B). Our model is
-initialized with:
-
-```python
-DEFAULT_CONFIG = dict(
-    vocab_size = 248_044,   # matches tokenizer exactly
-    ...
-)
-```
-
-If the model and tokenizer vocab sizes don't match, you'll get a shape error in
-the embedding table lookup.
+Scripts read the tokenizer path from the config (`tokenizer` field in
+`configs/base.json`) or from a checkpoint's saved config. v1 checkpoints have
+no such field and fall back to `Qwen/Qwen3.5-0.8B`.
+`len(tokenizer)` must be ≤ `vocab_size`, and `pretrain.py` asserts it.
 
 ---
 
 ## Files
 
-- [`tokenizer/verify.py`](../tokenizer/verify.py) — runs all Devanagari checks
+- [`scripts/train_tokenizer.py`](../scripts/train_tokenizer.py): train, round-trip check, compression report
+- [`scripts/tokenize_corpus.py`](../scripts/tokenize_corpus.py): JSONL → packed uint16 `.bin`
+- [`tokenizer/verify.py`](../tokenizer/verify.py): v1 Qwen Devanagari checks (historical)
 
 ---
 

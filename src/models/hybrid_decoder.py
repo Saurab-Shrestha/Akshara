@@ -57,17 +57,19 @@ with fla-org's implementation:
 Our PyTorch version is correct but runs the T-loop in Python (slow for long
 sequences). FLA's Triton kernel does the same math in one GPU pass.
 
-PARAMETER COUNT
----------------
-  12 layers: 9 GDNBlock (807k each) + 3 TransformerBlock (705k each) ≈ 9.4M
-  Token embedding (248k × 768)                                        ≈ 190M
-  Total unique                                                         ≈ 200M
+PARAMETER COUNT (v2 config: 32 layers, n_embed 1024, 48k vocab)
+----------------------------------------------------------------
+  32 layers: 24 GDNBlock + 8 TransformerBlock                ≈ 393.0M
+  Token embedding (49,152 × 1024, tied with lm_head)          ≈  50.3M
+  Total unique                                                ≈ 443.4M
+  (v1 used Qwen's 248k vocab: the embedding alone was 190M.)
 """
 
 from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.utils.checkpoint as ckpt
 
 from src.models.gdn_block import GDNBlock
@@ -84,6 +86,8 @@ def _build_layers(
     max_seq_len: int,
     attn_every:  int = 4,
     use_fla:     bool = False,
+    qk_norm:     bool = False,
+    gdn_impl:    str = "fla_layer",
 ) -> nn.ModuleList:
     """
     Build the 3:1 hybrid layer stack.
@@ -96,6 +100,7 @@ def _build_layers(
         max_seq_len:causal mask size (attention blocks only)
         attn_every: place a standard attention block every N layers (default 4 = 3:1 ratio)
         use_fla:    use FLA Triton kernel for GDN layers (GPU training speedup)
+        qk_norm:    QK-norm in the attention blocks (v2)
 
     Returns:
         ModuleList of alternating GDNBlock and TransformerBlock
@@ -103,10 +108,36 @@ def _build_layers(
     layers = []
     for i in range(n_layers):
         if (i + 1) % attn_every == 0:
-            layers.append(TransformerBlock(n_embed, n_heads, n_kv_heads, max_seq_len))
+            layers.append(TransformerBlock(n_embed, n_heads, n_kv_heads, max_seq_len, qk_norm))
         else:
-            layers.append(GDNBlock(n_embed, n_heads, use_fla=use_fla))
+            layers.append(GDNBlock(n_embed, n_heads, use_fla=use_fla, impl=gdn_impl))
     return nn.ModuleList(layers)
+
+
+def probs_from_logits(logits: torch.Tensor, temperature: float = 1.0, top_k: int | None = None,
+                      top_p: float | None = None) -> torch.Tensor:
+    """Next-token distribution. temperature 0 → one-hot argmax (greedy).
+    top_k keeps the k likeliest tokens; top_p (nucleus) the smallest set whose
+    probability reaches p."""
+    logits = logits.float()
+    if temperature <= 1e-6:
+        return F.one_hot(logits.argmax(-1), logits.shape[-1]).float()
+    logits = logits / temperature
+    if top_k:
+        kth = torch.topk(logits, min(top_k, logits.shape[-1])).values[..., -1:]
+        logits = logits.masked_fill(logits < kth, float("-inf"))
+    if top_p is not None and top_p < 1.0:
+        sorted_logits, idx = torch.sort(logits, descending=True)
+        cum = sorted_logits.softmax(-1).cumsum(-1)
+        drop = cum - sorted_logits.softmax(-1) > top_p        # keep the token that crosses p
+        logits = logits.masked_fill(drop.scatter(-1, idx, drop), float("-inf"))
+    return logits.softmax(-1)
+
+
+def sample(logits: torch.Tensor, temperature: float = 1.0, top_k: int | None = None,
+           top_p: float | None = None) -> torch.Tensor:
+    """(B, vocab) logits → (B, 1) token ids."""
+    return torch.multinomial(probs_from_logits(logits, temperature, top_k, top_p), 1)
 
 
 class HybridDecoder(nn.Module):
@@ -121,6 +152,9 @@ class HybridDecoder(nn.Module):
         max_seq_len: int,
         attn_every:  int = 4,
         use_fla:     bool = False,
+        qk_norm:     bool = False,
+        gdn_impl:    str = "fla_layer",
+        rope_theta:  float = 10000.0,
     ):
         """
         Args:
@@ -132,17 +166,23 @@ class HybridDecoder(nn.Module):
             max_seq_len: maximum sequence length
             attn_every:  full attention every N layers (4 = 3:1 ratio)
             use_fla:     use FLA Triton kernel for GDN layers
+            qk_norm:     QK-norm in attention blocks (v2; False keeps v1 checkpoints loadable)
+            gdn_impl:    "native" (v2: own GDN weights, FLA kernel on CUDA, decodes
+                         anywhere) or "fla_layer" (v1 checkpoints: FLA's module)
+            rope_theta:  RoPE base. Raised for long-context extension (ABF).
         """
         super().__init__()
         self.n_embed     = n_embed
         self.max_seq_len = max_seq_len
         self.gradient_checkpointing = False
+        self.ce_chunk = 0  # tokens per loss chunk in training; 0 = full logits (set by pretrain.py)
+        self.z_loss = 0.0  # z-loss coefficient (PaLM): + z * logsumexp(logits)^2 per token
 
         self.token_embed = nn.Embedding(vocab_size, n_embed)
 
         self.layers = _build_layers(
             n_layers, n_embed, n_heads, n_kv_heads, max_seq_len, attn_every,
-            use_fla=use_fla,
+            use_fla=use_fla, qk_norm=qk_norm, gdn_impl=gdn_impl,
         )
 
         self.norm    = RMSNorm(n_embed)
@@ -156,9 +196,12 @@ class HybridDecoder(nn.Module):
         # ×4 covers the visual prefix + full text at any supported resolution:
         # 448px → 1024 patches, 518px → 1369 patches; 1369 + 512 < 2048.
         head_dim       = n_embed // n_heads
-        freqs_cos, freqs_sin = precompute_freqs_cis(dim=head_dim, max_seq_len=max_seq_len * 4)
-        self.register_buffer("freqs_cos", freqs_cos)
-        self.register_buffer("freqs_sin", freqs_sin)
+        freqs_cos, freqs_sin = precompute_freqs_cis(dim=head_dim, max_seq_len=max_seq_len * 4,
+                                                    base=rope_theta)
+        # Not saved in checkpoints: rebuilt from max_seq_len / rope_theta, so a
+        # checkpoint loads into a model with a longer context or another base.
+        self.register_buffer("freqs_cos", freqs_cos, persistent=False)
+        self.register_buffer("freqs_sin", freqs_sin, persistent=False)
 
         self.apply(self._init_weights)
 
@@ -176,6 +219,12 @@ class HybridDecoder(nn.Module):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+        # older checkpoints saved the RoPE tables
+        state_dict.pop(prefix + "freqs_cos", None)
+        state_dict.pop(prefix + "freqs_sin", None)
+        super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
 
     def set_gradient_checkpointing(self, enabled: bool):
         self.gradient_checkpointing = enabled
@@ -215,7 +264,25 @@ class HybridDecoder(nn.Module):
             else:
                 x = layer(x, cos, sin)
 
-        x      = self.norm(x)
+        x = self.norm(x)
+
+        # Chunked cross-entropy (Wijmans et al. 2024, "Cut Your Losses"): the full
+        # logits tensor (B×T×49k, fp32 for the loss) dominates activation memory.
+        # Each chunk's logits are recomputed in backward, so only one chunk lives
+        # at a time. Training only; returns logits=None. Opt-in via ce_chunk > 0.
+        if targets is not None and self.training and self.ce_chunk > 0:
+            if vision_prefix is not None:
+                x = x[:, vision_prefix.shape[1]:]
+            h, t = x.reshape(-1, x.shape[-1]), targets.reshape(-1).long()
+
+            def _chunk_loss(hc, tc):
+                return self._token_loss_sum(self.lm_head(hc), tc)
+
+            total = sum(ckpt.checkpoint(_chunk_loss, h[i:i + self.ce_chunk], t[i:i + self.ce_chunk],
+                                        use_reentrant=False)
+                        for i in range(0, h.shape[0], self.ce_chunk))
+            return None, total / (t != -100).sum().clamp(min=1)
+
         logits = self.lm_head(x)
 
         loss = None
@@ -226,17 +293,60 @@ class HybridDecoder(nn.Module):
             else:
                 logits_for_loss = logits
 
-            B, L, V = logits_for_loss.shape
-            # ignore_index=-100: datasets mark padding positions (everything
-            # after the first EOS) as -100 so the model is never supervised
-            # to spam EOS over padding.
-            loss = torch.nn.functional.cross_entropy(
-                logits_for_loss.reshape(B * L, V),
-                targets.reshape(B * L).long(),
-                ignore_index=-100,
-            )
+            V = logits_for_loss.shape[-1]
+            # -100 targets: datasets mark padding positions (everything after
+            # the first EOS) so the model is never supervised to spam EOS.
+            t = targets.reshape(-1).long()
+            loss = self._token_loss_sum(logits_for_loss.reshape(-1, V), t) / (t != -100).sum().clamp(min=1)
 
         return logits, loss
+
+    def _token_loss_sum(self, logits: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        """Summed cross-entropy (+ z-loss) over tokens whose target is not -100."""
+        logits = logits.float()
+        loss = F.cross_entropy(logits, t, ignore_index=-100, reduction="sum")
+        if self.z_loss:
+            lse = torch.logsumexp(logits, dim=-1)
+            loss = loss + self.z_loss * (lse.square() * (t != -100)).sum()
+        return loss
+
+    # ── cached inference ───────────────────────────────────────────────────
+    # cache = {"pos": tokens seen so far, "layers": one dict per layer}
+    #   attention layer: {"k", "v"}  keys/values of every past token (KV cache)
+    #   GDN layer:       {"S"}       the fixed-size memory matrix
+    # Prefill runs the prompt once; each new token then costs one step.
+
+    def new_cache(self) -> dict:
+        return {"pos": 0, "layers": [{} for _ in self.layers]}
+
+    @torch.no_grad()
+    def forward_cached(self, token_ids: torch.Tensor | None, cache: dict,
+                       embeds: torch.Tensor | None = None, keep_states: bool = False) -> torch.Tensor:
+        """Run new tokens (and/or embeddings, e.g. a visual prefix placed before
+        them) through the model, continuing from ``cache``. Returns logits for
+        every new position: (B, T_new, vocab). keep_states → rollback() works."""
+        parts = ([embeds] if embeds is not None else []) + \
+                ([self.token_embed(token_ids)] if token_ids is not None else [])
+        x = torch.cat(parts, dim=1)
+        p, T = cache["pos"], x.shape[1]
+        assert p + T <= self.freqs_cos.shape[0], f"context {p + T} > RoPE table {self.freqs_cos.shape[0]}"
+        cos, sin = self.freqs_cos[p:p + T], self.freqs_sin[p:p + T]
+        for layer, c in zip(self.layers, cache["layers"]):
+            x = layer(x, cos, sin, cache=c, keep_states=keep_states)
+        cache["base"], cache["pos"] = p, p + T
+        return self.lm_head(self.norm(x))
+
+    @staticmethod
+    def rollback(cache: dict, n_keep: int) -> None:
+        """After forward_cached(..., keep_states=True), keep only its first n_keep
+        new tokens (speculative decoding drops rejected draft tokens)."""
+        pos = cache["base"] + n_keep
+        for c in cache["layers"]:
+            if "k" in c:                                  # attention: slice the KV cache
+                c["k"], c["v"] = c["k"][:, :, :pos], c["v"][:, :, :pos]
+            if "S_steps" in c:                            # GDN: memory after token n_keep
+                c["S"] = c["S_steps"][n_keep - 1] if n_keep else c["S_base"]
+        cache["pos"] = pos
 
     @torch.no_grad()
     def generate(
@@ -244,129 +354,35 @@ class HybridDecoder(nn.Module):
         token_ids:      torch.Tensor,
         max_new_tokens: int,
         temperature:    float = 1.0,
+        top_k:          int | None = None,
+        top_p:          float | None = None,
+        eos_token_id:   int | None = None,
+        vision_prefix:  torch.Tensor | None = None,
     ) -> torch.Tensor:
+        """
+        Cached autoregressive generation: the prompt (plus optional visual
+        prefix) is processed once, then every step feeds only the newest token.
+        Returns (B, T + generated). Finished rows are padded with eos_token_id.
+        """
+        cache = self.new_cache()
+        logits = self.forward_cached(token_ids, cache, embeds=vision_prefix)[:, -1]
+        finished = torch.zeros(token_ids.shape[0], dtype=torch.bool, device=token_ids.device)
         for _ in range(max_new_tokens):
-            ids_cond    = token_ids[:, -self.max_seq_len:]
-            logits, _   = self(ids_cond)
-            next_logits = logits[:, -1, :] / temperature
-            probs       = torch.softmax(next_logits, dim=-1)
-            next_id     = torch.multinomial(probs, num_samples=1)
-            token_ids   = torch.cat([token_ids, next_id], dim=1)
+            next_id = sample(logits, temperature, top_k, top_p)
+            if eos_token_id is not None:
+                next_id = torch.where(finished[:, None], torch.full_like(next_id, eos_token_id), next_id)
+                finished |= next_id[:, 0] == eos_token_id
+            token_ids = torch.cat([token_ids, next_id], dim=1)
+            if eos_token_id is not None and finished.all():
+                break
+            logits = self.forward_cached(next_id, cache)[:, -1]
         return token_ids
 
-    @torch.no_grad()
-    def generate_cached(
-        self,
-        vision_prefix:  torch.Tensor,
-        token_ids:      torch.Tensor,
-        max_new_tokens: int = 256,
-        temperature:    float = 0.0,
-        eos_token_id:   int | None = None,
-    ) -> torch.Tensor:
-        """
-        Autoregressive generation with GDN state caching.
-
-        The visual prefix is processed once through all layers; GDN memory
-        states are cached after the prefix.  For each decode step, GDN
-        layers only process the new token (using cached state — O(1) per
-        step instead of O(T)), while attention layers still attend to
-        the full accumulated sequence.
-
-        Per-layer hidden state buffers grow as tokens are generated
-        (12 × ~3k × 768 = ~28 MB at max length — negligible).
-
-        Args:
-            vision_prefix: (batch, n_patches, n_embed) — from the connector
-            token_ids:     (batch, T) — initial text tokens (at least BOS)
-            max_new_tokens: safety cap
-            temperature:   0.0 = greedy
-            eos_token_id:  stop at this token
-
-        Returns:
-            (batch, T + generated) — full sequence including input tokens
-        """
-        device = vision_prefix.device
-        B = vision_prefix.shape[0]
-
-        # ── Pre-fill: process visual prefix, build GDN states & hidden buffer ──
-        T_v = vision_prefix.shape[1]
-        cos = self.freqs_cos[:T_v]
-        sin = self.freqs_sin[:T_v]
-
-        # layer_out[li] = output of layer li (layer_out[0] = input to layer 0)
-        layer_out = [vision_prefix]
-        x = vision_prefix
-        for layer in self.layers:
-            if isinstance(layer, GDNBlock):
-                layer.gdn._capture_state = True
-                x = layer(x, cos, sin)
-            else:
-                x = layer(x, cos, sin)
-            layer_out.append(x)
-
-        # Collect captured GDN states
-        gdn_states: list[dict | None] = []
-        for layer in self.layers:
-            if isinstance(layer, GDNBlock):
-                gdn_states.append(getattr(layer.gdn, '_final_state', None))
-                layer.gdn._capture_state = False
-            else:
-                gdn_states.append(None)
-
-        text_tokens = token_ids
-        finished    = torch.zeros(B, dtype=torch.bool, device=device)
-
-        for _ in range(max_new_tokens):
-            x_t = self.token_embed(text_tokens[:, -1:])  # (B, 1, n_embed)
-            gdn_idx = -1
-
-            for li, layer in enumerate(self.layers):
-                L = layer_out[li].shape[1]
-
-                if isinstance(layer, GDNBlock):
-                    gdn_idx += 1
-                    new_out, new_state = layer.gdn.step(
-                        layer.norm1(x_t).squeeze(1),
-                        gdn_states[gdn_idx],
-                    )
-                    new_out = x_t.squeeze(1) + new_out
-                    new_out = new_out + layer.mlp(layer.norm2(new_out))
-                    gdn_states[gdn_idx] = new_state
-                    new_out = new_out.unsqueeze(1)
-                    layer_out[li + 1] = torch.cat([layer_out[li + 1], new_out], dim=1)
-                    x_t = new_out
-                else:
-                    # GDN layers before this have already appended the new
-                    # token's output to layer_out[li], so the full sequence
-                    # is already in place — no need to cat x_t.
-                    out = layer(layer_out[li], self.freqs_cos[:L], self.freqs_sin[:L])
-                    layer_out[li + 1] = out
-                    x_t = out[:, -1:, :]
-
-            # LM head
-            last_hid = self.norm(x_t)
-            next_logit = self.lm_head(last_hid).squeeze(1)
-
-            if temperature <= 1e-6:
-                next_id = next_logit.argmax(dim=-1, keepdim=True)
-            else:
-                probs = torch.softmax(next_logit / temperature, dim=-1)
-                next_id = torch.multinomial(probs, num_samples=1)
-
-            # Force EOS for finished sequences (or 0 if eos_token_id not set)
-            eos_val = eos_token_id if eos_token_id is not None else 0
-            next_id = torch.where(
-                finished.unsqueeze(1),
-                torch.full_like(next_id, eos_val),
-                next_id,
-            )
-            text_tokens = torch.cat([text_tokens, next_id], dim=1)
-            if eos_token_id is not None:
-                finished |= next_id.squeeze(1) == eos_token_id
-                if finished.all():
-                    break
-
-        return text_tokens
+    def generate_cached(self, vision_prefix, token_ids, max_new_tokens=256, temperature=0.0,
+                        eos_token_id=None):
+        """VLM entry point (src/models/vlm.py): greedy by default."""
+        return self.generate(token_ids, max_new_tokens, temperature, eos_token_id=eos_token_id,
+                             vision_prefix=vision_prefix)
 
     def layer_summary(self) -> str:
         """Print which layer is GDN vs Attention — useful for debugging."""
@@ -378,15 +394,16 @@ class HybridDecoder(nn.Module):
 
 
 # ── default config ─────────────────────────────────────────────────────────────
-DEFAULT_CONFIG = dict(
-    vocab_size  = 248_077,
-    n_embed     = 768,
-    n_heads     = 12,
-    n_kv_heads  = 3,
-    n_layers    = 12,
-    max_seq_len = 512,
+DEFAULT_CONFIG = dict(   # v2 — mirrors configs/base.json
+    vocab_size  = 49_152,
+    n_embed     = 1024,
+    n_heads     = 16,
+    n_kv_heads  = 4,
+    n_layers    = 32,
+    max_seq_len = 1024,
     attn_every  = 4,   # 3:1 ratio
     use_fla     = False,
+    qk_norm     = True,
 )
 
 

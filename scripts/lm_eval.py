@@ -24,6 +24,7 @@ import torch.nn.functional as F
 from transformers import AutoTokenizer
 
 from src.models.hybrid_decoder import HybridDecoder
+from src.checkpoint import load_checkpoint
 
 GEN_PROMPTS = {
     "Nepali — general": [
@@ -65,17 +66,22 @@ PPL_PAIRS = [
 
 
 def load(ckpt_path, device):
-    ck = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    ck = load_checkpoint(ckpt_path)
     c = ck["config"]
     model = HybridDecoder(
         vocab_size=c["vocab_size"], n_embed=c["n_embed"], n_heads=c["n_heads"],
         n_kv_heads=c["n_kv_heads"], n_layers=c["n_layers"],
         max_seq_len=c["max_seq_len"], attn_every=c["attn_every"],
         use_fla=c.get("use_fla", False),
+        qk_norm=c.get("qk_norm", False),
+        gdn_impl=c.get("gdn_impl", "fla_layer"),
+        rope_theta=c.get("rope_theta", 10000.0),
     )
     model.load_state_dict(ck["model_state_dict"])
     model.to(device).eval()
-    return model, c["max_seq_len"], ck.get("step")
+    # v1 checkpoints predate the "tokenizer" field → Qwen
+    tok = AutoTokenizer.from_pretrained(c.get("tokenizer", "Qwen/Qwen3.5-0.8B"), trust_remote_code=True)
+    return model, tok, c["max_seq_len"], ck.get("step")
 
 
 @torch.no_grad()
@@ -110,8 +116,7 @@ def main():
     ap.add_argument("--max_new", type=int, default=40)
     a = ap.parse_args()
 
-    tok = AutoTokenizer.from_pretrained("Qwen/Qwen3.5-0.8B", trust_remote_code=True)
-    model, max_seq_len, step = load(a.ckpt, a.device)
+    model, tok, max_seq_len, step = load(a.ckpt, a.device)
     print(f"\n{'='*70}\n LANGUAGE EVAL — checkpoint step {step}\n{'='*70}\n")
 
     print("── 1. GREEDY GENERATION (deterministic best continuation) ──\n")

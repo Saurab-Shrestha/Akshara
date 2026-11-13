@@ -1,261 +1,574 @@
 """
-Data preparation for Akshara — SmolLM-style quality-centric approach.
+Data preparation for Akshara — streaming, token-budgeted corpus (v2).
 
-Downloads and mixes multilingual text corpora with education-quality filtering.
+WHY v2
+------
+v1 collected ~965k docs into a Python list (~80–100M tokens) and the
+pretrain run cycled over it ~5×. v2 targets 3B+ *unique* tokens, so:
+    - budgets are in characters (≈ tokens × 3.5 with our BPE), not docs —
+      a Wikipedia article and a forum post are not the same "1 doc"
+    - each doc is streamed straight to disk; nothing is held in RAM
+    - the val split is a deterministic hash of the text (1 in 200), so it
+      spans every source even though sources are written one after another
 
-SOURCES:
-    FineWeb-2:    Multilingual web with quality scores.
-                  Primary source for Devanagari script languages.
-    FineWeb-Edu:  Education-filtered English web (EduScore >= 3).
-    Wikipedia:    Clean articles for all target languages (supplement).
+SOURCES (share of total characters)
+-----------------------------------
+    FineWeb-2   ne 30% · hi 25% · mr 4% · sa 1%   (length-filtered)
+    FineWeb-Edu en 30%                             (EduScore ≥ 3)
+    FineMath    3%     (finemath-4plus: digits, equations, reasoning text)
+    Wikipedia   ne 3% · hi 2% · en 2%              (curated)
+    Nepali extra  --nepali_share (default 15%, carved out of FineWeb-2 ne)
 
-QUALITY FILTER:
-    FineWeb-2: length-filtered only. FineWeb-2 exposes no single EduScore
-               field, so QUALITY_THRESHOLD does not apply here.
-    FineWeb-Edu: score >= QUALITY_THRESHOLD (EduScore 0-5).
-    Wikipedia: no filtering (already curated).
+NEPALI SOURCES
+--------------
+scripts/collect_nepali.py downloads HPLT 2.0, IndicCorpV2, FinePDFs, GlotCC
+and DCAD-2000 for Nepali into data/nepali/*.jsonl. They join MIX as ordinary
+budgeted sources (not through extra_langs, which is held in RAM and repeated
+up to 4x for minority languages). Their weights inside --nepali_share are in
+NEPALI below; files that are absent are skipped and the rest renormalized.
+Rationale: they are independent crawl/filter pipelines, so they add document
+diversity that FineWeb-2 alone cannot.
 
-DATA MIX (1M docs default):
-    70%  FineWeb-2 Devanagari (ne, hi, mr, sa)
-    20%  FineWeb-Edu          (English, high-quality)
-    10%  Wikipedia            (mixed ne, hi, en, mr, sa)
+English is 30%+ (up from v1's 20%) because the MLLM instruction data
+(LLaVA, Cauldron, Docmatix) is mostly English. If a source runs dry before
+its budget (FineWeb-2 Nepali may), the script says so and moves on.
 
-USAGE:
-    # Default 1M docs
-    PYTHONPATH=. python scripts/prepare_data.py
+LANGUAGES OF NEPAL (on top of the budget)
+-----------------------------------------
+Maithili, Newari, Bhojpuri, Awadhi, Tharu, Tamang, Sherpa, Doteli, Sunwar,
+Limbu (Devanagari + Limbu script), Santali (Ol Chiki): FineWeb-2 + their
+Wikipedias. Together they're ~0.1 GB, too small for a % budget, so ALL of it
+is taken and repeated 4×. Every row carries a "lang" tag so the tokenizer
+can oversample these languages and report per-language compression.
 
-    # Custom size
-    PYTHONPATH=. python scripts/prepare_data.py --max_samples 500000 --out_dir data/corpus_v4
+Hand-collected sources (Rai, Magar, Limbu, … from Bible translations, OPUS,
+Leipzig, MADLAD/HPLT, …) go in data/extra_langs/*.jsonl as
+{"text", "lang", "source"} rows. They join the same pool, exact-deduped
+against everything above. Bible-sourced text is kept 1× instead of 4×.
 
-    # Custom quality threshold
-    PYTHONPATH=. python scripts/prepare_data.py --quality 4
+USAGE
+-----
+    # ~12B chars ≈ 3.4B tokens (~30 GB of JSONL on disk)
+    PYTHONPATH=. python scripts/prepare_data.py --out_dir data/corpus_v5
+
+    # tiny smoke corpus
+    PYTHONPATH=. python scripts/prepare_data.py --total_chars 2e6 --out_dir /tmp/corpus_smoke
 """
 
 from __future__ import annotations
 
 import argparse
+import glob
+import hashlib
 import json
 import os
 import random
-from pathlib import Path
+import re
+import shutil
+import time
+import zlib
 
-# Minimum EduScore quality threshold (0–5, higher = more educational)
 QUALITY_THRESHOLD = 3
 
-# FineWeb-2 configs for Devanagari script languages
-_FINEWEB2_DEVANAGARI = {
-    "ne": "npi_Deva",
-    "hi": "hin_Deva",
-    "mr": "mar_Deva",
-    "sa": "san_Deva",
-}
+# (label, loader, loader-arg, share of total chars, lang tag)
+# Optional 6th field = train_only (license doesn't allow republishing).
+MIX = [
+    ("fineweb2/ne",  "fineweb2", "npi_Deva", 0.30, "npi"),
+    ("fineweb2/hi",  "fineweb2", "hin_Deva", 0.13, "hin"),   # bridge language for ne/mai/bho/awa
+    ("fineweb2/mr",  "fineweb2", "mar_Deva", 0.03, "mar"),
+    ("fineweb2/sa",  "fineweb2", "san_Deva", 0.01, "san"),
+    ("fineweb-edu",  "edu",      None,       0.24, "eng"),
+    ("code",         "code",     None,       0.09, "code"),
+    ("code/json",     "stack",   "json",     0.004, "code"),  # structured formats for JSON/tool output later
+    ("code/yaml",     "stack",   "yaml",     0.003, "code"),
+    ("code/markdown", "stack",   "markdown", 0.003, "code"),  # code improves NL reasoning (Aryabumi et al. 2024)
+    ("finemath",     "math",     None,       0.06, "eng"),
+    ("cosmopedia",   "cosmo",    None,       0.04, "eng"),   # synthetic textbooks / step-by-step explanations
+    # Parallel text (~1% total; each source is capped by how much exists).
+    # Tags like "eng-npi" keep pairs out of per-language stats and tokenizer floors.
+    # BPCC (ai4bharat): "subdir+subdir/lang". Human = seed + daily (CC-BY-4.0/CC0);
+    # mined = NLLB/Samanantar/comparable (CC0, noisier, NLLB-mai is mostly Bible).
+    ("parallel/bpcc-ne",  "bpcc", "bpcc-seed-latest+daily/npi_Deva", 0.003,  "eng-npi"),
+    ("parallel/bpcc-mai", "bpcc", "bpcc-seed-latest+daily/mai_Deva", 0.0015, "eng-mai"),
+    ("parallel/bpcc-sat", "bpcc", "bpcc-seed-latest+daily/sat_Olck", 0.0015, "eng-sat"),
+    ("parallel/bpcc-mined-ne",  "bpcc", "nllb_filtered+samanantar_v2+comparable/npi_Deva", 0.0095, "eng-npi"),
+    ("parallel/bpcc-mined-mai", "bpcc", "nllb_filtered/mai_Deva", 0.0005, "eng-mai"),
+    ("parallel/opus-ne",  "opus", "en-ne",    0.004,  "eng-npi", True),  # OPUS-100, license unknown
+    ("wiki/ne",      "wiki",     "20231101.ne", 0.03, "npi"),
+    ("wiki/hi",      "wiki",     "20231101.hi", 0.02, "hin"),
+    ("wiki/en",      "wiki",     "20231101.en", 0.02, "eng"),
+]
 
-# Wikipedia language codes
-_WIKI_CONFIGS = {
-    "ne": "20231101.ne",
-    "hi": "20231101.hi",
-    "en": "20231101.en",
-    "mr": "20231101.mr",
-    "sa": "20231101.sa",
-}
+# codeparrot-clean ships file contents + a per-file license; keep permissive only.
+PERMISSIVE_CODE = {"mit", "apache-2.0", "bsd-2-clause", "bsd-3-clause", "isc", "unlicense", "cc0-1.0", "mpl-2.0"}
+PARALLEL_PAIRS_PER_DOC = 16
+LANG_NAMES = {"ne": "नेपाली", "npi": "नेपाली", "mai": "मैथिली", "sat": "ᱥᱟᱱᱛᱟᱲᱤ"}
 
 
-def _load_fineweb2(config: str, max_samples: int) -> list[str]:
-    """Load documents from FineWeb-2 (length-filtered; no EduScore field)."""
+def parallel_docs(pairs, name_a: str, name_b: str):
+    """Group (a, b) translation pairs into documents of PARALLEL_PAIRS_PER_DOC.
+    Direction alternates per document so the model links concepts both ways."""
+    buf, flip = [], False
+    for a, b in pairs:
+        a, b = (a or "").strip(), (b or "").strip()
+        if len(a) < 10 or len(b) < 10:
+            continue
+        buf.append((a, b))
+        if len(buf) == PARALLEL_PAIRS_PER_DOC:
+            yield "\n\n".join(f"{name_b}: {y}\n{name_a}: {x}" if flip else f"{name_a}: {x}\n{name_b}: {y}"
+                               for x, y in buf)
+            buf, flip = [], not flip
+assert abs(sum(m[3] for m in MIX) - 1.0) < 1e-9
+
+# Annealing mix (--mix anneal): the data for the last ~15% of training, when the
+# WSD schedule decays the LR (scripts/pretrain.py, cfg.anneal_path). Weighted to
+# math, code, textbooks, Wikipedia and parallel text: small models gain most of
+# their reasoning here (MiniCPM, OLMo 2, SmolLM2). Streams start from the top, so
+# much of this repeats documents from the main corpus. That is intended: repeating
+# the best data during the decay is standard practice. Shares by MIX label.
+ANNEAL = {"fineweb2/ne": 0.20, "fineweb-edu": 0.20, "finemath": 0.15, "code": 0.10,
+          "code/json": 0.02, "code/markdown": 0.02, "cosmopedia": 0.10,
+          "wiki/ne": 0.04, "wiki/hi": 0.03, "wiki/en": 0.04, "fineweb2/hi": 0.05,
+          "parallel/bpcc-ne": 0.01, "parallel/bpcc-mined-ne": 0.03,
+          "parallel/bpcc-mai": 0.005, "parallel/bpcc-sat": 0.005}
+ANNEAL_MIX = [(m[0], m[1], m[2], ANNEAL[m[0]], *m[4:]) for m in MIX if m[0] in ANNEAL]
+assert len(ANNEAL_MIX) == len(ANNEAL) and abs(sum(m[3] for m in ANNEAL_MIX) - 1.0) < 1e-9
+
+# Nepali sources produced by scripts/collect_nepali.py. Weights are relative
+# *inside* --nepali_share; the budget is taken out of fineweb2/ne so MIX still
+# sums to 1.0. (label, loader, filename, weight, lang tag, train_only)
+NEPALI = [
+    ("nepali/hplt2",     "hfjsonl", "hf_hplt2_npi.jsonl",      0.36, "npi", False),
+    ("nepali/indiccorp", "hfjsonl", "hf_indiccorp_npi.jsonl",  0.30, "npi", False),
+    ("nepali/finepdfs",  "hfjsonl", "hf_finepdfs_npi.jsonl",   0.18, "npi", False),
+    ("nepali/glotcc",    "hfjsonl", "hf_glotcc_npi.jsonl",     0.08, "npi", False),
+    ("nepali/dcad2000",  "hfjsonl", "hf_dcad2000_npi.jsonl",   0.08, "npi", True),
+]
+DEFAULT_NEPALI_SHARE = 0.15
+
+# Languages of Nepal with little web text. Too small for a % budget: take ALL
+# of it and repeat it MINORITY_REPEATS times (Muennighoff et al. 2023: up to
+# ~4 epochs of repeated data is nearly as good as fresh data). Rai languages
+# and Magar are not in FineWeb-2 — they need hand-collected sources.
+# (label, loader, loader-arg, lang tag)
+MINORITY = [
+    ("fineweb2/mai",      "fineweb2", "mai_Deva", "mai"),   # Maithili
+    ("fineweb2/new",      "fineweb2", "new_Deva", "new"),   # Newari / Nepal Bhasa
+    ("fineweb2/bho",      "fineweb2", "bho_Deva", "bho"),   # Bhojpuri
+    ("fineweb2/awa",      "fineweb2", "awa_Deva", "awa"),   # Awadhi
+    ("fineweb2/thl",      "fineweb2", "thl_Deva", "thl"),   # Dangaura Tharu
+    ("fineweb2/taj",      "fineweb2", "taj_Deva", "taj"),   # Eastern Tamang
+    ("fineweb2/xsr",      "fineweb2", "xsr_Deva", "xsr"),   # Sherpa
+    ("fineweb2/dty",      "fineweb2", "dty_Deva", "dty"),   # Doteli
+    ("fineweb2/suz",      "fineweb2", "suz_Deva", "suz"),   # Sunwar
+    ("fineweb2/lif-deva", "fineweb2", "lif_Deva", "lif"),   # Limbu (Devanagari)
+    ("fineweb2/lif-limb", "fineweb2", "lif_Limb", "lif"),   # Limbu (Limbu script)
+    ("fineweb2/sat-olck", "fineweb2", "sat_Olck", "sat"),   # Santali (Ol Chiki)
+    ("wiki/new",          "wiki",     "20231101.new", "new"),
+    ("wiki/mai",          "wiki",     "20231101.mai", "mai"),
+    ("wiki/bh",           "wiki",     "20231101.bh",  "bho"),
+    ("wiki/awa",          "wiki",     "20231101.awa", "awa"),
+    ("wiki/dty",          "wiki",     "20231101.dty", "dty"),
+    ("wiki/sat",          "wiki",     "20231101.sat", "sat"),
+]
+MINORITY_REPEATS = 4            # max repeats for the smallest languages
+MINORITY_TARGET_CHARS = 200e6   # repeat a language until ~this many chars, capped above
+BIBLE_SOURCES = ("bible", "door43")
+
+
+def lang_repeats(per_lang_chars: dict[str, int]) -> dict[str, int]:
+    """Repeat small languages up to MINORITY_REPEATS×, big ones (Maithili, Newari,
+    Bhojpuri: 300M+ chars) not at all — otherwise 4× repeats would make the
+    minority pool ~30% of the corpus."""
+    return {l: max(1, min(MINORITY_REPEATS, round(MINORITY_TARGET_CHARS / max(1, c))))
+            for l, c in per_lang_chars.items()}
+
+
+def stream_texts(kind: str, arg: str | None, quality: int):
+    """Yield cleaned document texts (≥50 chars) from one HF source, streaming."""
     from datasets import load_dataset
 
-    try:
-        ds = load_dataset(
-            "HuggingFaceFW/fineweb-2", config, split="train", streaming=True,
-        )
-    except Exception as e:
-        print(f"    [warn] cannot load FineWeb-2 '{config}': {e}")
-        return []
+    if kind == "fineweb2":
+        # Read the parquet files directly: some configs (e.g. new_Deva) carry
+        # extra columns, and casting them to the repo's declared schema fails.
+        ds = load_dataset("parquet", split="train", streaming=True,
+                          data_files=f"hf://datasets/HuggingFaceFW/fineweb-2/data/{arg}/train/*.parquet")
+    elif kind == "edu":
+        ds = load_dataset("HuggingFaceFW/fineweb-edu", "sample-100BT", split="train", streaming=True)
+    elif kind == "math":
+        ds = load_dataset("HuggingFaceTB/finemath", "finemath-4plus", split="train", streaming=True)
+    elif kind == "wiki":
+        ds = load_dataset("wikimedia/wikipedia", arg, split="train", streaming=True)
+    elif kind == "cosmo":
+        ds = load_dataset("HuggingFaceTB/smollm-corpus", "cosmopedia-v2", split="train", streaming=True)
+    elif kind == "stack":
+        # The Stack dedup (v1, gated): JSON / YAML / Markdown so the model has seen
+        # structured formats before SFT. Every listed repo license must be permissive.
+        ds = load_dataset("parquet", split="train", streaming=True,
+                          data_files=f"hf://datasets/bigcode/the-stack-dedup/data/{arg}/*.parquet",
+                          columns=["content", "max_stars_repo_licenses", "alphanum_fraction",
+                                   "max_line_length", "size"])
+        for r in ds:
+            lic = r.get("max_stars_repo_licenses") or []
+            if not lic or any(l.lower() not in PERMISSIVE_CODE for l in lic):
+                continue
+            if not 200 <= (r.get("size") or 0) <= 50_000 or (r.get("max_line_length") or 0) > 1000 \
+                    or (r.get("alphanum_fraction") or 0) < 0.25:
+                continue
+            yield r["content"].strip()
+        return
+    elif kind == "code":
+        # SmolLM's python-edu / stack-edu hold only Software Heritage blob ids
+        # (contents need AWS S3); codeparrot-clean includes the file text.
+        for r in load_dataset("codeparrot/codeparrot-clean", split="train", streaming=True):
+            if (r.get("license") or "").lower() not in PERMISSIVE_CODE or r.get("autogenerated"):
+                continue
+            if (r.get("alpha_frac") or 0) < 0.25 or (r.get("line_max") or 0) > 1000:
+                continue
+            t = (r.get("content") or "").strip()
+            if len(t) >= 200:
+                yield t
+        return
+    elif kind == "opus":
+        src, tgt = arg.split("-")
+        ds = load_dataset("parquet", split="train", streaming=True,
+                          data_files=f"hf://datasets/Helsinki-NLP/opus-100/{arg}/train-*.parquet")
+        pairs = (((r.get("translation") or {}).get(src, ""), (r.get("translation") or {}).get(tgt, ""))
+                 for r in ds)
+        yield from parallel_docs(pairs, "English", LANG_NAMES[tgt])
+        return
+    elif kind == "bpcc":
+        # arg "dir1+dir2/lang". Column order differs per subdir, so read the header.
+        from huggingface_hub import hf_hub_download
+        dirs, lang = arg.split("/")
+        unq = lambda t: t[1:-1].replace('""', '"') if len(t) > 1 and t[0] == t[-1] == '"' else t
+        def rows():
+            for d in dirs.split("+"):
+                path = hf_hub_download("ai4bharat/BPCC", f"{d}/{lang}.tsv", repo_type="dataset")
+                with open(path, encoding="utf-8") as f:
+                    head = f.readline().rstrip("\n").split("\t")
+                    si, ti = head.index("src"), head.index("tgt")
+                    for line in f:
+                        cols = line.rstrip("\n").split("\t")
+                        if len(cols) > max(si, ti):
+                            yield unq(cols[si]), unq(cols[ti])
+        yield from parallel_docs(rows(), "English", LANG_NAMES[lang.split("_")[0]])
+        return
+    elif kind == "hfjsonl":
+        # Local corpus from scripts/collect_nepali.py: one {"text",...} per line.
+        with open(arg, encoding="utf-8") as f:
+            for line in f:
+                t = (json.loads(line).get("text") or "").strip()
+                if len(t) >= 50:
+                    yield t
+        return
+    else:
+        raise ValueError(kind)
 
-    texts: list[str] = []
     it = iter(ds)
-    i = 0
-    while len(texts) < max_samples:
+    while True:
         try:
             sample = next(it)
         except StopIteration:
-            break
+            return
         except Exception as e:
-            if "Cast" in type(e).__name__ or "Schema" in type(e).__name__:
-                continue
-            raise
-        i += 1
-        text = sample.get("text")
-        if text is None:
-            continue
-        text = text.strip()
-        if len(text) >= 50:
-            texts.append(text)
-        if i % 10000 == 0:
-            print(f"    ... {i} scanned, {len(texts)} kept")
-    return texts
-
-
-def _load_fineweb_edu(
-    max_samples: int, min_quality: int,
-) -> list[str]:
-    """Load English documents from FineWeb-Edu filtered by EduScore."""
-    from datasets import load_dataset
-
-    ds = load_dataset(
-        "HuggingFaceFW/fineweb-edu", "sample-100BT",
-        split="train", streaming=True,
-    )
-    texts: list[str] = []
-    for sample in ds:
-        if len(texts) >= max_samples:
-            break
-        score = sample.get("score")
-        if score is not None and score < min_quality:
+            # A schema error ends the stream — never swallow it silently
+            print(f"    [warn] {kind}/{arg} stream error, stopping source: {type(e).__name__}: {str(e)[:120]}")
+            return
+        if kind == "edu" and (sample.get("score") or 0) < quality:
             continue
         text = (sample.get("text") or "").strip()
         if len(text) >= 50:
-            texts.append(text)
-    return texts
+            yield text
 
 
-def _load_wiki(lang: str, max_samples: int) -> list[str]:
-    """Load Wikipedia articles for a language."""
-    from datasets import load_dataset
+SCRIPT_RANGES = {"Deva": ("\u0900", "\u097f"), "Limb": ("\u1900", "\u194f"), "Olck": ("\u1c50", "\u1c7f")}
 
-    config = _WIKI_CONFIGS.get(lang)
-    if config is None:
+
+def expected_script(arg: str) -> str:
+    """FineWeb-2 configs end in the script (mai_Deva, lif_Limb); Santali Wikipedia is Ol Chiki."""
+    return arg.split("_")[-1] if "_" in arg else ("Olck" if arg.endswith(".sat") else "Deva")
+
+
+def script_ok(text: str, script: str, min_ratio: float = 0.5) -> bool:
+    """Keep a minority-language doc only if most of its letters are in the expected
+    script — low-resource web subsets are often English or boilerplate
+    (Kreutzer et al. 2022)."""
+    lo, hi = SCRIPT_RANGES[script]
+    letters = [c for c in text if c.isalpha()]
+    return bool(letters) and sum(lo <= c <= hi for c in letters) / len(letters) >= min_ratio
+
+
+def is_val(text: str) -> bool:
+    return zlib.crc32(text.encode("utf-8")) % 200 == 0
+
+
+def iter_extra(extra_dir: str):
+    """Hand-collected minority-language JSONL ({"text","lang","source"}),
+    one file per source+language — see data/extra_langs/MANIFEST_*.json."""
+    if not extra_dir or not os.path.isdir(extra_dir):
+        return
+    licenses = {}
+    for mf in glob.glob(os.path.join(extra_dir, "MANIFEST_*.json")):
+        with open(mf, encoding="utf-8") as f:
+            for e in json.load(f):
+                if e.get("file"):
+                    licenses[os.path.basename(e["file"])] = e.get("license") or ""
+    for path in sorted(glob.glob(os.path.join(extra_dir, "*.jsonl"))):
+        with open(path, encoding="utf-8") as f:
+            first = json.loads(f.readline())
+        lic = licenses.get(os.path.basename(path))
+        def texts(path=path):
+            with open(path, encoding="utf-8") as f:
+                for line in f:
+                    t = json.loads(line)["text"].strip()
+                    if len(t) >= 20:
+                        yield t
+        yield path, first["lang"], first.get("source", ""), train_only(lic), texts()
+
+
+def train_only(license: str | None) -> bool:
+    """Train on it, never publish it: non-commercial / no-derivatives / not
+    redistributable licenses, and anything without a known license."""
+    if not license:
+        return True
+    lic = license.upper()
+    # "other" / "per-subsource" = aggregates whose parts carry their own licenses
+    return any(k in lic for k in ("NC", "NON-COMMERCIAL", "REDISTRIBUTABLE=FALSE", "UNCLEAR",
+                                  "NONE STATED", "OTHER", "PER-SUBSOURCE", "RESERVED",
+                                  "NO PART", "PERMISSION", "UNKNOWN"))
+
+
+def _row(text: str, lang: str, train_only: bool = False) -> str:
+    row = {"text": text, "lang": lang}
+    if train_only:
+        row["train_only"] = True   # excluded from any public release of the corpus
+    return json.dumps(row, ensure_ascii=False) + "\n"
+
+
+def doc_key(text: str) -> bytes:
+    """Exact-duplicate key: first 400 chars, whitespace-normalised."""
+    return hashlib.blake2b(re.sub(r"\s+", " ", text.strip())[:400].encode("utf-8"), digest_size=8).digest()
+
+
+def nepali_jobs(nepali_dir: str, share: float) -> list[tuple]:
+    """Resolve the NEPALI registry to concrete (label, kind, path, share, lang,
+    train_only) jobs. Missing files are skipped and the remaining weights are
+    renormalized, so a partial download still produces a full 1.0 mix."""
+    if share <= 0 or not os.path.isdir(nepali_dir):
         return []
-
-    ds = load_dataset(
-        "wikimedia/wikipedia", config, split="train", streaming=True
-    )
-    texts: list[str] = []
-    for sample in ds:
-        if len(texts) >= max_samples:
-            break
-        text = (sample.get("text") or "").strip()
-        if len(text) >= 50:
-            texts.append(text)
-    return texts
+    present = [n for n in NEPALI if os.path.exists(os.path.join(nepali_dir, n[2]))]
+    if not present:
+        return []
+    w = sum(n[3] for n in present)
+    jobs = [(label, kind, os.path.join(nepali_dir, fn), share * weight / w, lang, nc)
+            for label, kind, fn, weight, lang, nc in present]
+    print(f"[nepali] {len(present)}/{len(NEPALI)} source(s) on disk: "
+          + ", ".join(f"{j[0].split('/')[-1]} {j[3]:.1%}" for j in jobs))
+    return jobs
 
 
-def _write_jsonl(texts: list[str], path: str):
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        for t in texts:
-            f.write(json.dumps({"text": t}, ensure_ascii=False) + "\n")
+def prepare_corpus(total_chars: float, out_dir: str, quality: int,
+                   minority: bool = True, seed: int = 42,
+                   extra_dir: str = "data/extra_langs",
+                   nepali_share: float = DEFAULT_NEPALI_SHARE,
+                   nepali_dir: str = "data/nepali", mix: list = MIX):
+    os.makedirs(out_dir, exist_ok=True)
 
+    # Nepali extra sources are paid for out of fineweb2/ne, so MIX still sums
+    # to 1.0 and the total character budget is unchanged.
+    take = 0.0
+    extra = nepali_jobs(nepali_dir, nepali_share)
+    if extra:
+        fw = next(m[3] for m in mix if m[0] == "fineweb2/ne")
+        take = min(nepali_share, fw)
+        if take < nepali_share:
+            print(f"[nepali] --nepali_share {nepali_share:.0%} > fineweb2/ne {fw:.0%}; "
+                  f"using {take:.0%}")
+            extra = nepali_jobs(nepali_dir, take)
+    jobs = []
+    for m in mix:
+        label, kind, arg, share, lang = m[:5]
+        jobs.append((label, kind, arg, share - take if label == "fineweb2/ne" else share,
+                     lang, m[5] if len(m) > 5 else False))
+    jobs += extra
+    assert abs(sum(j[3] for j in jobs) - 1.0) < 1e-9
 
-def prepare_corpus(
-    max_samples: int = 200_000,
-    seed: int = 42,
-    val_ratio: float = 0.05,
-    out_dir: str = "data/corpus",
-    quality: int = QUALITY_THRESHOLD,
-):
-    """
-    Download a multilingual corpus with SmolLM-style quality filtering.
-
-    Data mix:
-        - 70% FineWeb-2 Devanagari (ne, hi, mr, sa)
-        - 20% FineWeb-Edu English
-        - 10% Wikipedia (multilingual)
-    """
-    rng = random.Random(seed)
-    out = Path(out_dir)
-
-    n_fw2 = int(max_samples * 0.70)
-    n_edu = int(max_samples * 0.20)
-    n_wiki = int(max_samples * 0.10)
-
-    all_texts: list[str] = []
-
-    # --- FineWeb-2 Devanagari ---
-    fw2_targets = {
-        "ne (Nepali)": int(n_fw2 * 0.38),
-        "hi (Hindi)": int(n_fw2 * 0.38),
-        "mr (Marathi)": int(n_fw2 * 0.16),
-        "sa (Sanskrit)": int(n_fw2 * 0.08),
-    }
-    for label, target in fw2_targets.items():
-        lang_code = label.split(" ")[0]
-        config = _FINEWEB2_DEVANAGARI.get(lang_code)
-        if config is None or target == 0:
+    # Each budgeted source is written to its own part file with a .done marker,
+    # so a rerun after a crash or a network hang (HF streams can block forever in
+    # an SSL read; build_corpus.sh kills and reruns on a stall) skips finished
+    # sources and restarts only the interrupted one. Streams are deterministic,
+    # so a restarted source yields the same documents.
+    parts = os.path.join(out_dir, "parts")
+    os.makedirs(parts, exist_ok=True)
+    stats = {}
+    # HPLT / GlotCC / ... and FineWeb-2 all come from CommonCrawl: on corpus_v6,
+    # 30% of HPLT and 15% of GlotCC docs were exact copies of FineWeb-2 Nepali
+    # docs. The nepali/* sources skip anything already in the fineweb2/ne part.
+    # ponytail: exact (prefix) dedup only; MinHash near-dedup would catch more.
+    fw_keys: set[bytes] | None = None
+    for label, kind, arg, share, lang, nc in jobs:
+        stem = os.path.join(parts, label.replace("/", "__"))
+        if label.startswith("nepali/") and fw_keys is None:
+            fw_keys = set()
+            fw = os.path.join(parts, "fineweb2__ne")
+            for ext in (".train", ".val"):
+                if os.path.exists(fw + ext):
+                    with open(fw + ext, encoding="utf-8") as f:
+                        fw_keys.update(doc_key(json.loads(line)["text"]) for line in f)
+            print(f"[nepali] dedup against {len(fw_keys):,} fineweb2/ne docs")
+        if os.path.exists(stem + ".done"):
+            stats[label] = tuple(json.load(open(stem + ".done")))
+            print(f"[{label}] done earlier: {stats[label][1]/1e6:,.0f}M chars")
             continue
-        print(f"  [FineWeb-2 {label}] loading {target:,} docs...")
-        try:
-            texts = _load_fineweb2(config, target)
-            print(f"    → got {len(texts):,} docs")
-            all_texts.extend(texts)
-        except Exception as e:
-            print(f"    [warn] failed to load FineWeb-2 {config}: {e}")
-            continue
+        budget = int(total_chars * share)
+        got, docs, t0 = 0, 0, time.time()
+        print(f"[{label}] target {budget/1e6:,.0f}M chars")
+        dup = 0
+        with open(stem + ".train", "w", encoding="utf-8") as ftr, \
+             open(stem + ".val", "w", encoding="utf-8") as fva:
+            try:
+                for text in stream_texts(kind, arg, quality):
+                    if fw_keys is not None and label.startswith("nepali/") and doc_key(text) in fw_keys:
+                        dup += 1
+                        continue
+                    (fva if is_val(text) else ftr).write(_row(text, lang, nc))
+                    got += len(text)
+                    docs += 1
+                    if docs % 50_000 == 0:
+                        print(f"    {docs:,} docs | {got/1e6:,.0f}M chars | {time.time()-t0:.0f}s")
+                    if got >= budget:
+                        break
+            except Exception as e:
+                print(f"    [warn] {label} failed after {docs:,} docs: {e}")
+        if dup:
+            print(f"    skipped {dup:,} docs already in fineweb2/ne")
+        if got < budget:
+            print(f"    [warn] {label} exhausted at {got/1e6:,.0f}M / {budget/1e6:,.0f}M chars")
+        stats[label] = (docs, got)
+        json.dump([docs, got], open(stem + ".done", "w"))
 
-    # --- FineWeb-Edu English ---
-    print(f"  [FineWeb-Edu] loading {n_edu:,} docs (quality>={quality})...")
-    edu_texts = _load_fineweb_edu(n_edu, min_quality=quality)
-    print(f"    → got {len(edu_texts):,} docs")
-    all_texts.extend(edu_texts)
+    mstem = os.path.join(parts, "minority")
+    if minority and os.path.exists(mstem + ".done"):
+        stats.update({k: tuple(v) for k, v in json.load(open(mstem + ".done")).items()})
+        print("[minority] done earlier")
+        minority = False
+    with open(mstem + ".train", "a", encoding="utf-8") as ftr, \
+         open(mstem + ".val", "a", encoding="utf-8") as fva:
+        if minority:   # a crashed earlier attempt may have left a partial part
+            ftr.truncate(0)
+            fva.truncate(0)
 
-    # --- Wikipedia multilingual ---
-    wiki_langs = {"ne": 0.3, "hi": 0.25, "en": 0.25, "mr": 0.1, "sa": 0.1}
-    for lang_code, ratio in wiki_langs.items():
-        target = int(n_wiki * ratio)
-        if target == 0:
-            continue
-        print(f"  [Wikipedia {lang_code}] loading {target:,} docs...")
-        texts = _load_wiki(lang_code, target)
-        print(f"    → got {len(texts):,} docs")
-        all_texts.extend(texts)
+        # Minority languages: take everything, write val once, then write the
+        # train docs in reshuffled passes, so copies of one doc sit ~a whole
+        # pass apart and never share a training window. Repeats are sized per
+        # language (lang_repeats): small languages up to 4×, big ones 1×.
+        # ponytail: whole minority pool held in RAM (~2B chars ≈ 5 GB); switch to
+        # an on-disk shuffle if it outgrows the box.
+        if minority:
+            pool: list[tuple[str, str, bool, bool]] = []   # (text, lang, bible, train_only)
+            seen: set[bytes] = set()                       # exact dedupe across sources
+            sources: dict[str, tuple[str, int, int]] = {}  # label -> (lang, docs, chars)
 
-    print(f"\n[data] total collected: {len(all_texts):,} docs")
+            def add(label, texts, lang, bible=False, nc=False):
+                got = docs = 0
+                try:
+                    for text in texts:
+                        h = hashlib.sha1(text.strip().encode("utf-8")).digest()
+                        if h in seen:
+                            continue
+                        seen.add(h)
+                        if is_val(text):
+                            fva.write(_row(text, lang, nc))
+                        else:
+                            pool.append((text, lang, bible, nc))
+                        got += len(text)
+                        docs += 1
+                except Exception as e:
+                    print(f"    [warn] {label} failed after {docs:,} docs: {e}")
+                print(f"[{label}] {lang}: {docs:,} docs, {got/1e6:,.1f}M chars"
+                      + (" [bible 1×]" if bible else "") + (" [train-only]" if nc else ""))
+                sources[label] = (lang, docs, got, bible)
 
-    # Trim to exact max_samples if oversampled
-    if len(all_texts) > max_samples:
-        rng.shuffle(all_texts)
-        all_texts = all_texts[:max_samples]
+            for label, kind, arg, lang in MINORITY:
+                script = expected_script(arg)
+                texts = (t for t in stream_texts(kind, arg, quality) if script_ok(t, script))
+                add(label, texts, lang)
+            for path, lang, source, nc, texts in iter_extra(extra_dir):
+                # Bible-derived text (eBible, door43) is one narrow register: kept 1×
+                bible = any(b in source.lower() for b in BIBLE_SOURCES)
+                add(f"extra/{os.path.basename(path)}", texts, lang, bible, nc)
 
-    rng.shuffle(all_texts)
+            per_lang: dict[str, int] = {}
+            for lang, _, chars, _ in sources.values():
+                per_lang[lang] = per_lang.get(lang, 0) + chars
+            reps = lang_repeats(per_lang)
+            print("[minority] repeats per language: " + ", ".join(
+                f"{l} {per_lang[l]/1e6:.0f}M×{reps[l]}" for l in sorted(per_lang, key=lambda l: -per_lang[l])))
+            for label, (lang, docs, chars, bible) in sources.items():
+                r = 1 if bible else reps[lang]
+                stats[label] = (docs * r, chars * r)
 
-    n_val = max(1, int(len(all_texts) * val_ratio))
-    val_docs = all_texts[:n_val]
-    train_docs = all_texts[n_val:]
+            rng = random.Random(seed)
+            for k in range(MINORITY_REPEATS):
+                rng.shuffle(pool)
+                ftr.writelines(_row(t, l, nc) for t, l, b, nc in pool
+                               if k < (1 if b else reps[l]))
+            json.dump({k: stats[k] for k in sources}, open(mstem + ".done", "w"))
 
-    _write_jsonl(train_docs, str(out / "train.jsonl"))
-    _write_jsonl(val_docs, str(out / "val.jsonl"))
-    print(f"[data] done — {len(train_docs)} train / {len(val_docs)} val → {out}/")
+    # Assemble the parts, deleting each once appended (peak disk = corpus + one part).
+    # ponytail: a crash mid-assembly leaves parts half-deleted; delete out_dir and rebuild.
+    with open(os.path.join(out_dir, "train.jsonl"), "w", encoding="utf-8") as ftr, \
+         open(os.path.join(out_dir, "val.jsonl"), "w", encoding="utf-8") as fva:
+        for stem in [os.path.join(parts, j[0].replace("/", "__")) for j in jobs] + [mstem]:
+            for ext, f in ((".train", ftr), (".val", fva)):
+                with open(stem + ext, encoding="utf-8") as src:
+                    shutil.copyfileobj(src, f, 1 << 24)
+                os.remove(stem + ext)
+    shutil.rmtree(parts)
+
+    total = sum(c for _, c in stats.values())
+    fmt = lambda n: f"{n/1e9:.2f}B" if n >= 1e9 else f"{n/1e6:,.1f}M"
+    print(f"\n[data] {fmt(total)} chars (≈{total/3.5/1e9:.2f}B tokens) → {out_dir}/")
+    for label, (docs, chars) in stats.items():
+        print(f"  {label:<18} {docs:>10,} docs  {fmt(chars):>9} chars  {chars/max(1,total):6.2%}")
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Akshara data preparation (SmolLM-style)"
-    )
-    parser.add_argument(
-        "--max_samples", type=int, default=1_000_000,
-        help="Total target document count (default: 1M)",
-    )
-    parser.add_argument(
-        "--out_dir", type=str, default="data/corpus",
-        help="Output directory for the corpus JSONL files",
-    )
-    parser.add_argument(
-        "--quality", type=int, default=QUALITY_THRESHOLD,
-        help="Minimum EduScore quality threshold 0-5 (default: 3)",
-    )
-    parser.add_argument(
-        "--seed", type=int, default=42,
-        help="Random seed for train/val split",
-    )
-    args = parser.parse_args()
-
-    prepare_corpus(
-        max_samples=args.max_samples,
-        seed=args.seed,
-        out_dir=args.out_dir,
-        quality=args.quality,
-    )
+    ap = argparse.ArgumentParser(description="Akshara corpus preparation (streaming, char-budgeted)")
+    ap.add_argument("--total_chars", type=float, default=12e9, help="total character budget (default 12e9 ≈ 3.4B tokens)")
+    ap.add_argument("--out_dir", default="data/corpus_v5")
+    ap.add_argument("--quality", type=int, default=QUALITY_THRESHOLD, help="FineWeb-Edu min EduScore")
+    ap.add_argument("--no_minority", action="store_true", help="skip the minority-language sources")
+    ap.add_argument("--extra_dir", default="data/extra_langs",
+                    help="hand-collected minority-language JSONL ({text, lang, source})")
+    ap.add_argument("--nepali_share", type=float, default=DEFAULT_NEPALI_SHARE,
+                    help="share of total chars from data/nepali/ (carved out of fineweb2/ne); 0 disables")
+    ap.add_argument("--nepali_dir", default="data/nepali",
+                    help="output of scripts/collect_nepali.py")
+    ap.add_argument("--mix", choices=["main", "anneal"], default="main",
+                    help="anneal = math/code/textbook-heavy mix for the LR decay phase (use with --no_minority)")
+    args = ap.parse_args()
+    prepare_corpus(args.total_chars, args.out_dir, args.quality,
+                   minority=not args.no_minority, extra_dir=args.extra_dir,
+                   nepali_share=args.nepali_share, nepali_dir=args.nepali_dir,
+                   mix=ANNEAL_MIX if args.mix == "anneal" else MIX)
 
 
 if __name__ == "__main__":
-    main()
+    import sys
+    if sys.argv[1:] == ["--selftest"]:
+        assert script_ok("नेपाल भाषा", "Deva") and not script_ok("The Limbu Language Kit", "Limb")
+        assert script_ok("ᤛᤡᤖᤡᤈᤨᤅ", "Limb") and expected_script("lif_Limb") == "Limb"
+        assert expected_script("20231101.sat") == "Olck" and expected_script("20231101.new") == "Deva"
+        assert train_only("CC BY-NC-ND 3.0") and train_only("CC BY-NC 4.0") and train_only(None)
+        assert not train_only("CC BY-SA 4.0") and not train_only("CC0") and not train_only("CC BY 2.0 FR")
+        assert train_only("other (per-subsource licenses)") and train_only("odc-by (per-subsource licenses)")
+        assert not train_only("odc-by") and not train_only("cc0-1.0 (CC ToU)")
+        docs = list(parallel_docs([(f"english sentence {i}", f"नेपाली वाक्य {i}") for i in range(32)], "English", "नेपाली"))
+        assert len(docs) == 2 and docs[0].startswith("English:") and docs[1].startswith("नेपाली:")
+        assert train_only("All rights reserved") and train_only("no part may be reproduced")
+        assert lang_repeats({"mai": 400e6, "sat": 130e6, "awa": 65e6, "lif": 3e6}) == {"mai": 1, "sat": 2, "awa": 3, "lif": 4}
+        print("prepare_data selftest passed")
+    else:
+        main()

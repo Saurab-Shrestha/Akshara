@@ -82,6 +82,9 @@ class Akshara(nn.Module):
         max_seq_len: int = 512,
         attn_every:  int = 4,
         use_fla:     bool = False,
+        qk_norm:     bool = False,
+        gdn_impl:    str = "fla_layer",
+        rope_theta:  float = 10000.0,
     ):
         super().__init__()
 
@@ -109,6 +112,9 @@ class Akshara(nn.Module):
             max_seq_len = max_seq_len,
             attn_every  = attn_every,
             use_fla     = use_fla,
+            qk_norm     = qk_norm,
+            gdn_impl    = gdn_impl,
+            rope_theta  = rope_theta,
         )
 
     def forward(
@@ -141,7 +147,8 @@ class Akshara(nn.Module):
         # logits shape from decoder: (B, n_patches + T, vocab_size)
         # Slice to text portion only — callers only care about text predictions
         n_visual = visual_prefix.shape[1]
-        logits   = logits[:, n_visual:, :]   # (B, T, vocab_size)
+        if logits is not None:               # None when the decoder used chunked CE
+            logits = logits[:, n_visual:, :]   # (B, T, vocab_size)
 
         return logits, loss
 
