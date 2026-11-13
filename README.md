@@ -62,7 +62,7 @@ pip install -r requirements.txt
 **For GPU training**, also install the FLA kernel and log into HF (checkpoint backup). On an ephemeral cloud box (Lightning/Kaggle) the conda env resets each session — reinstall FLA every time:
 
 ```bash
-pip install flash-linear-attention==0.5.1   # GDN Triton kernel (CUDA only)
+pip install flash-linear-attention         # GDN Triton kernel (CUDA only); code targets the 0.6 API
 huggingface-cli login                        # write-scoped token → checkpoint backup
 ```
 
