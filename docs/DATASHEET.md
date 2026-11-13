@@ -41,7 +41,8 @@ subsets). Training also uses a packed uint16 token version (`*.bin`).
 | FineWeb-2 `hin_Deva` | hin | 13% | ODC-By 1.0 |
 | FineWeb-2 `mar_Deva` / `san_Deva` | mar / san | 3% / 1% | ODC-By 1.0 |
 | FineWeb-Edu (EduScore ≥ 3) | eng | 24% | ODC-By 1.0 |
-| codeparrot-clean (Python; MIT/Apache/BSD/ISC/MPL/CC0/Unlicense files only; quality-filtered) | code | 10% | per-file permissive |
+| codeparrot-clean (Python; MIT/Apache/BSD/ISC/MPL/CC0/Unlicense files only; quality-filtered) | code | 9% | per-file permissive |
+| The Stack dedup v1: JSON / YAML / Markdown (all repo licenses permissive; 200 B–50 KB; line ≤ 1000) | code | 0.4% / 0.3% / 0.3% | per-file permissive |
 | FineMath `finemath-4plus` | eng | 6% | ODC-By 1.0 |
 | Cosmopedia v2 (smollm-corpus) | eng | 4% | ODC-By 1.0 |
 | BPCC seed + daily en↔npi / mai / sat (human-translated) | eng-npi / eng-mai / eng-sat | 0.3% / 0.15% / 0.15% | CC0 / CC-BY-4.0 |

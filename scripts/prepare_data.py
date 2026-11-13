@@ -76,7 +76,10 @@ MIX = [
     ("fineweb2/mr",  "fineweb2", "mar_Deva", 0.03, "mar"),
     ("fineweb2/sa",  "fineweb2", "san_Deva", 0.01, "san"),
     ("fineweb-edu",  "edu",      None,       0.24, "eng"),
-    ("code",         "code",     None,       0.10, "code"),  # code improves NL reasoning (Aryabumi et al. 2024)
+    ("code",         "code",     None,       0.09, "code"),
+    ("code/json",     "stack",   "json",     0.004, "code"),  # structured formats for JSON/tool output later
+    ("code/yaml",     "stack",   "yaml",     0.003, "code"),
+    ("code/markdown", "stack",   "markdown", 0.003, "code"),  # code improves NL reasoning (Aryabumi et al. 2024)
     ("finemath",     "math",     None,       0.06, "eng"),
     ("cosmopedia",   "cosmo",    None,       0.04, "eng"),   # synthetic textbooks / step-by-step explanations
     # Parallel text (~1% total; each source is capped by how much exists).
@@ -182,6 +185,22 @@ def stream_texts(kind: str, arg: str | None, quality: int):
         ds = load_dataset("wikimedia/wikipedia", arg, split="train", streaming=True)
     elif kind == "cosmo":
         ds = load_dataset("HuggingFaceTB/smollm-corpus", "cosmopedia-v2", split="train", streaming=True)
+    elif kind == "stack":
+        # The Stack dedup (v1, gated): JSON / YAML / Markdown so the model has seen
+        # structured formats before SFT. Every listed repo license must be permissive.
+        ds = load_dataset("parquet", split="train", streaming=True,
+                          data_files=f"hf://datasets/bigcode/the-stack-dedup/data/{arg}/*.parquet",
+                          columns=["content", "max_stars_repo_licenses", "alphanum_fraction",
+                                   "max_line_length", "size"])
+        for r in ds:
+            lic = r.get("max_stars_repo_licenses") or []
+            if not lic or any(l.lower() not in PERMISSIVE_CODE for l in lic):
+                continue
+            if not 200 <= (r.get("size") or 0) <= 50_000 or (r.get("max_line_length") or 0) > 1000 \
+                    or (r.get("alphanum_fraction") or 0) < 0.25:
+                continue
+            yield r["content"].strip()
+        return
     elif kind == "code":
         # SmolLM's python-edu / stack-edu hold only Software Heritage blob ids
         # (contents need AWS S3); codeparrot-clean includes the file text.
