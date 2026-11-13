@@ -72,7 +72,7 @@ QUALITY_THRESHOLD = 3
 # Optional 6th field = train_only (license doesn't allow republishing).
 MIX = [
     ("fineweb2/ne",  "fineweb2", "npi_Deva", 0.30, "npi"),
-    ("fineweb2/hi",  "fineweb2", "hin_Deva", 0.20, "hin"),   # bridge language for ne/mai/bho/awa
+    ("fineweb2/hi",  "fineweb2", "hin_Deva", 0.19, "hin"),   # bridge language for ne/mai/bho/awa
     ("fineweb2/mr",  "fineweb2", "mar_Deva", 0.03, "mar"),
     ("fineweb2/sa",  "fineweb2", "san_Deva", 0.01, "san"),
     ("fineweb-edu",  "edu",      None,       0.24, "eng"),
@@ -81,9 +81,13 @@ MIX = [
     ("cosmopedia",   "cosmo",    None,       0.03, "eng"),   # synthetic textbooks / step-by-step explanations
     # Parallel text (~1% total; each source is capped by how much exists).
     # Tags like "eng-npi" keep pairs out of per-language stats and tokenizer floors.
-    ("parallel/bpcc-ne",  "bpcc", "npi_Deva", 0.003,  "eng-npi"),   # BPCC seed, CC0/CC-BY-4.0, human
-    ("parallel/bpcc-mai", "bpcc", "mai_Deva", 0.0015, "eng-mai"),
-    ("parallel/bpcc-sat", "bpcc", "sat_Olck", 0.0015, "eng-sat"),
+    # BPCC (ai4bharat): "subdir+subdir/lang". Human = seed + daily (CC-BY-4.0/CC0);
+    # mined = NLLB/Samanantar/comparable (CC0, noisier, NLLB-mai is mostly Bible).
+    ("parallel/bpcc-ne",  "bpcc", "bpcc-seed-latest+daily/npi_Deva", 0.003,  "eng-npi"),
+    ("parallel/bpcc-mai", "bpcc", "bpcc-seed-latest+daily/mai_Deva", 0.0015, "eng-mai"),
+    ("parallel/bpcc-sat", "bpcc", "bpcc-seed-latest+daily/sat_Olck", 0.0015, "eng-sat"),
+    ("parallel/bpcc-mined-ne",  "bpcc", "nllb_filtered+samanantar_v2+comparable/npi_Deva", 0.0095, "eng-npi"),
+    ("parallel/bpcc-mined-mai", "bpcc", "nllb_filtered/mai_Deva", 0.0005, "eng-mai"),
     ("parallel/opus-ne",  "opus", "en-ne",    0.004,  "eng-npi", True),  # OPUS-100, license unknown
     ("wiki/ne",      "wiki",     "20231101.ne", 0.03, "npi"),
     ("wiki/hi",      "wiki",     "20231101.hi", 0.02, "hin"),
@@ -199,17 +203,21 @@ def stream_texts(kind: str, arg: str | None, quality: int):
         yield from parallel_docs(pairs, "English", LANG_NAMES[tgt])
         return
     elif kind == "bpcc":
-        # Human-translated seed set; TSV columns: tgt, src (English), src_lang, tgt_lang
+        # arg "dir1+dir2/lang". Column order differs per subdir, so read the header.
         from huggingface_hub import hf_hub_download
-        path = hf_hub_download("ai4bharat/BPCC", f"bpcc-seed-latest/{arg}.tsv", repo_type="dataset")
+        dirs, lang = arg.split("/")
+        unq = lambda t: t[1:-1].replace('""', '"') if len(t) > 1 and t[0] == t[-1] == '"' else t
         def rows():
-            with open(path, encoding="utf-8") as f:
-                next(f)  # header
-                for line in f:
-                    cols = line.rstrip("\n").split("\t")
-                    if len(cols) >= 2:
-                        yield cols[1], cols[0]
-        yield from parallel_docs(rows(), "English", LANG_NAMES[arg.split("_")[0]])
+            for d in dirs.split("+"):
+                path = hf_hub_download("ai4bharat/BPCC", f"{d}/{lang}.tsv", repo_type="dataset")
+                with open(path, encoding="utf-8") as f:
+                    head = f.readline().rstrip("\n").split("\t")
+                    si, ti = head.index("src"), head.index("tgt")
+                    for line in f:
+                        cols = line.rstrip("\n").split("\t")
+                        if len(cols) > max(si, ti):
+                            yield unq(cols[si]), unq(cols[ti])
+        yield from parallel_docs(rows(), "English", LANG_NAMES[lang.split("_")[0]])
         return
     elif kind == "hfjsonl":
         # Local corpus from scripts/collect_nepali.py: one {"text",...} per line.
