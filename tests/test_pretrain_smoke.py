@@ -56,6 +56,27 @@ def test_chunked_ce_matches_full():
     assert all(torch.allclose(a, p.grad, atol=1e-6) for a, p in zip(g_full, m.parameters()))
 
 
+def test_z_loss_and_no_wd_embed():
+    from types import SimpleNamespace
+    from src.optim import build_optimizer
+    torch.manual_seed(0)
+    m = HybridDecoder(**dict(TINY, vocab_size=1000))
+    ids, t = torch.randint(0, 1000, (2, 32)), torch.randint(0, 1000, (2, 32))
+    _, base = m(ids, t)
+    m.z_loss = 1e-2
+    logits, with_z = m(ids, t)
+    z = 1e-2 * torch.logsumexp(logits.float(), -1).square().mean()
+    assert torch.allclose(with_z, base + z, atol=1e-5)
+    m.ce_chunk = 20                                               # chunked path adds the same z-loss
+    assert torch.allclose(m(ids, t)[1], with_z, atol=1e-5)
+
+    cfg = SimpleNamespace(optimizer="muon", lr=1e-3, weight_decay=0.1, no_wd_embed=True)
+    adamw = build_optimizer(m, cfg, "cpu").opts[1]
+    emb = m.token_embed.weight
+    assert all(id(p) != id(emb) for p in adamw.param_groups[0]["params"])   # decayed group
+    assert any(id(p) == id(emb) for p in adamw.param_groups[1]["params"])   # no-decay group
+
+
 def _bin(path: Path, n_tokens: int, seed: int):
     rng = np.random.default_rng(seed)
     rng.integers(16, 2000, n_tokens, dtype=np.uint16).tofile(path)
@@ -71,7 +92,7 @@ def test_pretrain_runs_switches_to_anneal_and_resumes(tmp_path):
                batch_size=2, grad_accum=1, train_steps=12, warmup_steps=2,
                schedule="wsd", decay_frac=0.25, optimizer="muon", lr=1e-3, min_lr=1e-4,
                eval_steps=6, eval_iters=1, save_every=6, use_amp=False,
-               use_gradient_checkpointing=False, compile=False, ce_chunk=16,
+               use_gradient_checkpointing=False, compile=False, ce_chunk=16, no_wd_embed=True, z_loss=1e-4,
                out_ckpt=str(ckpt), log_dir=str(tmp_path / "logs"), hf_repo=None)
     (tmp_path / "cfg.json").write_text(json.dumps(cfg))
 

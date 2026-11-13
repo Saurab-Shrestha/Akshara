@@ -130,6 +130,8 @@ class PretrainConfig(ModelConfig):
     schedule: str = "cosine"          # "wsd" (v2): warmup, flat at lr, linear decay over the last decay_frac
     decay_frac: float = 0.15
     anneal_path: Optional[str] = None # wsd only: train on this .bin during the decay phase
+    no_wd_embed: bool = False         # v2: no weight decay on the token embedding
+    z_loss: float = 0.0               # v2: 1e-5 (SmolLM3), keeps logits from drifting large
 
     # Checkpointing
     out_ckpt: str = "checkpoints/pretrain.pt"

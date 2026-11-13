@@ -64,11 +64,15 @@ def build_optimizer(model: torch.nn.Module, cfg, device: str):
     named = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
     muon = [p for n, p in named if cfg.optimizer == "muon" and _is_muon_param(n, p)]
     muon_ids = {id(p) for p in muon}
-    rest = [p for _, p in named if id(p) not in muon_ids]
+    rest = [(n, p) for n, p in named if id(p) not in muon_ids]
+    # v2: no weight decay on the (tied) token embedding, as in OLMo 2 / SmolLM3.
+    # Off by default so v1 optimizer checkpoints keep their param-group layout.
+    no_wd_embed = getattr(cfg, "no_wd_embed", False)
+    decay = lambda n, p: p.ndim >= 2 and not (no_wd_embed and "embed" in n)
 
     adamw = torch.optim.AdamW([
-        {"params": [p for p in rest if p.ndim >= 2], "weight_decay": cfg.weight_decay},
-        {"params": [p for p in rest if p.ndim < 2],  "weight_decay": 0.0},
+        {"params": [p for n, p in rest if decay(n, p)],     "weight_decay": cfg.weight_decay},
+        {"params": [p for n, p in rest if not decay(n, p)], "weight_decay": 0.0},
     ], lr=cfg.lr, betas=(0.9, 0.95),
        fused=device.startswith("cuda") and torch.cuda.is_available())
 
@@ -76,7 +80,7 @@ def build_optimizer(model: torch.nn.Module, cfg, device: str):
         return adamw  # plain AdamW keeps v1 optimizer checkpoints resumable
 
     print(f"[optim] Muon: {sum(p.numel() for p in muon)/1e6:.1f}M params in "
-          f"{len(muon)} matrices | AdamW: {sum(p.numel() for p in rest)/1e6:.1f}M")
+          f"{len(muon)} matrices | AdamW: {sum(p.numel() for _, p in rest)/1e6:.1f}M")
     return MultiOptimizer(
         torch.optim.Muon(muon, lr=cfg.lr, weight_decay=cfg.weight_decay,
                          adjust_lr_fn="match_rms_adamw"),

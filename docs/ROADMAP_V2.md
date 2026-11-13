@@ -153,7 +153,10 @@ PYTHONPATH=. python scripts/pretrain.py --config configs/a100_pretrain_v2.json \
 
 Recipe: Muon (`adjust_lr_fn="match_rms_adamw"`, so one lr drives both
 optimizers), wd 0.1, 98k tokens/step (8 × 1024 × 12), bf16 + FLA,
-90k steps ≈ 8.9B tokens on `corpus_v6`. **WSD schedule:** 1k warmup, flat at
+90k steps ≈ 8.9B tokens on `corpus_v6`. No weight decay on the tied embedding,
+z-loss 1e-5, random 1024-token windows (sequence-level shuffle) — all per the
+[Smol Training Playbook](https://huggingface.co/spaces/HuggingFaceTB/smol-training-playbook).
+**WSD schedule:** 2k warmup (~2%), flat at
 4e-4, then linear decay to 4e-5 over the last 15% of steps. During that decay
 the loader switches to the annealing set (`anneal_path`), a math/code/textbook/
 parallel-heavy mix built with:

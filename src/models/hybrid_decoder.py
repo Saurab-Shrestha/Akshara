@@ -144,6 +144,7 @@ class HybridDecoder(nn.Module):
         self.max_seq_len = max_seq_len
         self.gradient_checkpointing = False
         self.ce_chunk = 0  # tokens per loss chunk in training; 0 = full logits (set by pretrain.py)
+        self.z_loss = 0.0  # z-loss coefficient (PaLM): + z * logsumexp(logits)^2 per token
 
         self.token_embed = nn.Embedding(vocab_size, n_embed)
 
@@ -234,7 +235,7 @@ class HybridDecoder(nn.Module):
             h, t = x.reshape(-1, x.shape[-1]), targets.reshape(-1).long()
 
             def _chunk_loss(hc, tc):
-                return F.cross_entropy(self.lm_head(hc).float(), tc, ignore_index=-100, reduction="sum")
+                return self._token_loss_sum(self.lm_head(hc), tc)
 
             total = sum(ckpt.checkpoint(_chunk_loss, h[i:i + self.ce_chunk], t[i:i + self.ce_chunk],
                                         use_reentrant=False)
@@ -251,17 +252,22 @@ class HybridDecoder(nn.Module):
             else:
                 logits_for_loss = logits
 
-            B, L, V = logits_for_loss.shape
-            # ignore_index=-100: datasets mark padding positions (everything
-            # after the first EOS) as -100 so the model is never supervised
-            # to spam EOS over padding.
-            loss = torch.nn.functional.cross_entropy(
-                logits_for_loss.reshape(B * L, V),
-                targets.reshape(B * L).long(),
-                ignore_index=-100,
-            )
+            V = logits_for_loss.shape[-1]
+            # -100 targets: datasets mark padding positions (everything after
+            # the first EOS) so the model is never supervised to spam EOS.
+            t = targets.reshape(-1).long()
+            loss = self._token_loss_sum(logits_for_loss.reshape(-1, V), t) / (t != -100).sum().clamp(min=1)
 
         return logits, loss
+
+    def _token_loss_sum(self, logits: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        """Summed cross-entropy (+ z-loss) over tokens whose target is not -100."""
+        logits = logits.float()
+        loss = F.cross_entropy(logits, t, ignore_index=-100, reduction="sum")
+        if self.z_loss:
+            lse = torch.logsumexp(logits, dim=-1)
+            loss = loss + self.z_loss * (lse.square() * (t != -100)).sum()
+        return loss
 
     @torch.no_grad()
     def generate(

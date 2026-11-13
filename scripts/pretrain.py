@@ -277,6 +277,7 @@ def main() -> None:
     if cfg.use_gradient_checkpointing:
         model.set_gradient_checkpointing(True)
     model.ce_chunk = cfg.ce_chunk
+    model.z_loss = cfg.z_loss
     model = model.to(device)
 
     # --- optional resume (before compile / DataParallel so keys match) ---
