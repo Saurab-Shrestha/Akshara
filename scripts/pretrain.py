@@ -12,7 +12,8 @@ WHY pretrain before OCR fine-tuning:
 TRAINING RECIPE (v2):
     - Own 48k BPE tokenizer (cfg.tokenizer) + packed uint16 .bin shards.
     - Muon on hidden matrices + AdamW on embeddings/norms (cfg.optimizer).
-    - Cosine LR schedule with linear warmup.
+    - LR schedule: cosine (v1) or WSD (v2): warmup, a long flat phase, then a
+      linear decay over the last decay_frac of steps on the anneal_path data.
     - bf16 autocast on A100; FLA Triton kernel for GDN.
     - Periodic eval (perplexity), checkpoint saving, HF Hub backup.
 
@@ -79,6 +80,58 @@ def cosine_lr(
     return min_lr + 0.5 * (lr - min_lr) * (1.0 + math.cos(math.pi * progress))
 
 
+def wsd_lr(step: int, warmup_steps: int, max_steps: int, lr: float, min_lr: float,
+           decay_frac: float) -> float:
+    """
+    Warmup-Stable-Decay (MiniCPM, 2024): linear warmup, hold at ``lr``, then decay
+    linearly to ``min_lr`` over the last ``decay_frac`` of steps.
+
+    WHY: the flat phase does not depend on the total length, so a run can be
+    extended mid-way (only the decay start moves), and the decay phase is where
+    the high-quality annealing data goes. Matches or beats cosine at equal compute.
+    """
+    if step < warmup_steps:
+        return lr * step / max(1, warmup_steps)
+    start = decay_start(warmup_steps, max_steps, decay_frac)
+    if step < start:
+        return lr
+    return lr + (min_lr - lr) * min(1.0, (step - start) / max(1, max_steps - start))
+
+
+def decay_start(warmup_steps: int, max_steps: int, decay_frac: float) -> int:
+    return max(warmup_steps, max_steps - int(decay_frac * max_steps))
+
+
+def lr_at(step: int, cfg) -> float:
+    if cfg.schedule == "wsd":
+        return wsd_lr(step, cfg.warmup_steps, cfg.train_steps, cfg.lr, cfg.min_lr, cfg.decay_frac)
+    if cfg.schedule == "cosine":
+        return cosine_lr(step, cfg.warmup_steps, cfg.train_steps, cfg.lr, cfg.min_lr)
+    raise ValueError(f"unknown schedule {cfg.schedule!r}")
+
+
+def data_path_at(step: int, cfg) -> str:
+    """The anneal set replaces the main corpus once the WSD decay starts."""
+    if (cfg.schedule == "wsd" and cfg.anneal_path
+            and step >= decay_start(cfg.warmup_steps, cfg.train_steps, cfg.decay_frac)):
+        if os.path.exists(cfg.anneal_path):
+            return cfg.anneal_path
+        print(f"[pretrain] WARNING anneal_path {cfg.anneal_path} missing; decaying on train_path")
+    return cfg.train_path
+
+
+def unwrap(model: nn.Module) -> nn.Module:
+    """Strip DataParallel / torch.compile wrappers so state_dict keys carry no
+    'module.' / '_orig_mod.' prefix and load into a plain HybridDecoder."""
+    while True:
+        if isinstance(model, nn.DataParallel):
+            model = model.module
+        elif hasattr(model, "_orig_mod"):
+            model = model._orig_mod
+        else:
+            return model
+
+
 def amp_context(use_amp: bool, amp_dtype: str | None, device: str):
     """
     Return an autocast context manager, or a no-op if AMP is disabled.
@@ -128,7 +181,7 @@ def save_checkpoint(path: str, model: nn.Module, optimizer, step: int, cfg: Pret
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     torch.save({
         "step": step,
-        "model_state_dict": model.state_dict(),
+        "model_state_dict": unwrap(model).state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "config": vars(cfg),
     }, path)
@@ -223,6 +276,23 @@ def main() -> None:
         model.set_gradient_checkpointing(True)
     model = model.to(device)
 
+    # --- optional resume (before compile / DataParallel so keys match) ---
+    start_step = 0
+    ck = None
+    if args.resume and os.path.exists(args.resume):
+        ck = torch.load(args.resume, map_location="cpu", weights_only=False)
+        sd = {k.removeprefix("_orig_mod.").removeprefix("module."): v
+              for k, v in ck["model_state_dict"].items()}
+        model.load_state_dict(sd)
+        start_step = ck.get("step", 0)
+        print(f"[pretrain] resumed from {args.resume} at step {start_step}")
+
+    # --- optimizer: built on the plain model (same param tensors as any wrapper) ---
+    optimizer = build_optimizer(model, cfg, device)
+    if ck is not None and "optimizer_state_dict" in ck:
+        optimizer.load_state_dict(ck["optimizer_state_dict"])
+    del ck
+
     if cfg.compile:
         torch.set_float32_matmul_precision("high")
         print("[pretrain] compiling model with torch.compile...")
@@ -232,33 +302,17 @@ def main() -> None:
     n_params = sum(p.numel() for p in model.parameters())
     print(f"[pretrain] model params: {n_params:,} (~{n_params / 1e6:.1f}M)")
 
-    # --- optional resume (load before DataParallel so keys match) ---
-    start_step = 0
-    if args.resume and os.path.exists(args.resume):
-        ck = torch.load(args.resume, map_location="cpu", weights_only=False)
-        model.load_state_dict(ck["model_state_dict"])
-        start_step = ck.get("step", 0)
-        print(f"[pretrain] resumed from {args.resume} at step {start_step}")
-
-    # --- optimizer: build before DataParallel (references same param tensors) ---
-    optimizer = build_optimizer(model, cfg, device)
-
-    if args.resume and os.path.exists(args.resume):
-        ck = torch.load(args.resume, map_location="cpu", weights_only=False)
-        if "optimizer_state_dict" in ck:
-            optimizer.load_state_dict(ck["optimizer_state_dict"])
-
     # --- multi-GPU: wrap in DataParallel if multiple GPUs available ---
     n_gpus = torch.cuda.device_count() if device == "cuda" else 0
     if n_gpus > 1:
         print(f"[pretrain] {n_gpus}× GPU detected — using DataParallel (effective batch ×{n_gpus})")
         model = nn.DataParallel(model)
-    # raw_model: always the unwrapped model (for state_dict saving)
-    raw_model = model.module if isinstance(model, nn.DataParallel) else model
+    raw_model = unwrap(model)  # for state_dict saving
 
     # --- data ---
+    cur_path = data_path_at(start_step, cfg)
     train_loader = get_text_dataloader(
-        cfg.train_path, tokenizer, cfg.batch_size, cfg.max_seq_len, shuffle=True
+        cur_path, tokenizer, cfg.batch_size, cfg.max_seq_len, shuffle=True
     )
     dev_loader = get_text_dataloader(
         cfg.dev_path, tokenizer, cfg.batch_size, cfg.max_seq_len, shuffle=False
@@ -286,9 +340,15 @@ def main() -> None:
     accum_loss  = 0.0
 
     for step in range(start_step, cfg.train_steps):
-        lr = cosine_lr(step, cfg.warmup_steps, cfg.train_steps, cfg.lr, cfg.min_lr)
+        lr = lr_at(step, cfg)
         for g in optimizer.param_groups:
             g["lr"] = lr
+
+        if (path := data_path_at(step, cfg)) != cur_path:
+            print(f"[pretrain] step {step}: LR decay starts, switching data {cur_path} → {path}")
+            cur_path = path
+            train_loader = get_text_dataloader(path, tokenizer, cfg.batch_size, cfg.max_seq_len, shuffle=True)
+            train_iter = iter(train_loader)
 
         optimizer.zero_grad(set_to_none=True)
         accum_loss = 0.0

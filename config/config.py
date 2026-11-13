@@ -127,6 +127,9 @@ class PretrainConfig(ModelConfig):
     weight_decay: float = 0.1
     optimizer: str = "adamw"          # "muon" (v2): Muon on hidden matrices, AdamW on the rest
     grad_clip: float = 1.0
+    schedule: str = "cosine"          # "wsd" (v2): warmup, flat at lr, linear decay over the last decay_frac
+    decay_frac: float = 0.15
+    anneal_path: Optional[str] = None # wsd only: train on this .bin during the decay phase
 
     # Checkpointing
     out_ckpt: str = "checkpoints/pretrain.pt"

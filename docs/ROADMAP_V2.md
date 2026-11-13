@@ -152,8 +152,22 @@ PYTHONPATH=. python scripts/pretrain.py --config configs/a100_pretrain_v2.json \
 ```
 
 Recipe: Muon (`adjust_lr_fn="match_rms_adamw"`, so one lr drives both
-optimizers) lr 4e-4 → 4e-5 cosine, 1k warmup, wd 0.1, 98k tokens/step
-(8 × 1024 × 12), bf16 + FLA, 32.5k steps ≈ 3.2B tokens.
+optimizers), wd 0.1, 98k tokens/step (8 × 1024 × 12), bf16 + FLA,
+90k steps ≈ 8.9B tokens on `corpus_v6`. **WSD schedule:** 1k warmup, flat at
+4e-4, then linear decay to 4e-5 over the last 15% of steps. During that decay
+the loader switches to the annealing set (`anneal_path`), a math/code/textbook/
+parallel-heavy mix built with:
+
+```bash
+PYTHONPATH=. python scripts/prepare_data.py --mix anneal --no_minority \
+    --total_chars 4.5e9 --nepali_share 0.10 --out_dir data/corpus_anneal
+PYTHONPATH=. python scripts/tokenize_corpus.py --input data/corpus_anneal/train.jsonl \
+    --tokenizer tokenizer/akshara-bpe
+```
+
+Because the flat phase doesn't depend on the run length, `train_steps` can be
+raised mid-run when more compute appears; only the decay start moves.
+`PYTHONPATH=. pytest -q tests/` runs the whole loop on CPU in ~15 s (also in CI).
 
 **Compute — read before starting.** 443M params ≈ 6 × 443M = 2.7 GFLOP/token.
 

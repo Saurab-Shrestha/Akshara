@@ -118,6 +118,20 @@ def parallel_docs(pairs, name_a: str, name_b: str):
             buf, flip = [], not flip
 assert abs(sum(m[3] for m in MIX) - 1.0) < 1e-9
 
+# Annealing mix (--mix anneal): the data for the last ~15% of training, when the
+# WSD schedule decays the LR (scripts/pretrain.py, cfg.anneal_path). Weighted to
+# math, code, textbooks, Wikipedia and parallel text: small models gain most of
+# their reasoning here (MiniCPM, OLMo 2, SmolLM2). Streams start from the top, so
+# much of this repeats documents from the main corpus. That is intended: repeating
+# the best data during the decay is standard practice. Shares by MIX label.
+ANNEAL = {"fineweb2/ne": 0.20, "fineweb-edu": 0.20, "finemath": 0.15, "code": 0.10,
+          "code/json": 0.02, "code/markdown": 0.02, "cosmopedia": 0.10,
+          "wiki/ne": 0.04, "wiki/hi": 0.03, "wiki/en": 0.04, "fineweb2/hi": 0.05,
+          "parallel/bpcc-ne": 0.01, "parallel/bpcc-mined-ne": 0.03,
+          "parallel/bpcc-mai": 0.005, "parallel/bpcc-sat": 0.005}
+ANNEAL_MIX = [(m[0], m[1], m[2], ANNEAL[m[0]], *m[4:]) for m in MIX if m[0] in ANNEAL]
+assert len(ANNEAL_MIX) == len(ANNEAL) and abs(sum(m[3] for m in ANNEAL_MIX) - 1.0) < 1e-9
+
 # Nepali sources produced by scripts/collect_nepali.py. Weights are relative
 # *inside* --nepali_share; the budget is taken out of fineweb2/ne so MIX still
 # sums to 1.0. (label, loader, filename, weight, lang tag, train_only)
@@ -351,7 +365,7 @@ def prepare_corpus(total_chars: float, out_dir: str, quality: int,
                    minority: bool = True, seed: int = 42,
                    extra_dir: str = "data/extra_langs",
                    nepali_share: float = DEFAULT_NEPALI_SHARE,
-                   nepali_dir: str = "data/nepali"):
+                   nepali_dir: str = "data/nepali", mix: list = MIX):
     os.makedirs(out_dir, exist_ok=True)
 
     # Nepali extra sources are paid for out of fineweb2/ne, so MIX still sums
@@ -359,14 +373,14 @@ def prepare_corpus(total_chars: float, out_dir: str, quality: int,
     take = 0.0
     extra = nepali_jobs(nepali_dir, nepali_share)
     if extra:
-        fw = next(m[3] for m in MIX if m[0] == "fineweb2/ne")
+        fw = next(m[3] for m in mix if m[0] == "fineweb2/ne")
         take = min(nepali_share, fw)
         if take < nepali_share:
             print(f"[nepali] --nepali_share {nepali_share:.0%} > fineweb2/ne {fw:.0%}; "
                   f"using {take:.0%}")
             extra = nepali_jobs(nepali_dir, take)
     jobs = []
-    for m in MIX:
+    for m in mix:
         label, kind, arg, share, lang = m[:5]
         jobs.append((label, kind, arg, share - take if label == "fineweb2/ne" else share,
                      lang, m[5] if len(m) > 5 else False))
@@ -470,10 +484,13 @@ def main():
                     help="share of total chars from data/nepali/ (carved out of fineweb2/ne); 0 disables")
     ap.add_argument("--nepali_dir", default="data/nepali",
                     help="output of scripts/collect_nepali.py")
+    ap.add_argument("--mix", choices=["main", "anneal"], default="main",
+                    help="anneal = math/code/textbook-heavy mix for the LR decay phase (use with --no_minority)")
     args = ap.parse_args()
     prepare_corpus(args.total_chars, args.out_dir, args.quality,
                    minority=not args.no_minority, extra_dir=args.extra_dir,
-                   nepali_share=args.nepali_share, nepali_dir=args.nepali_dir)
+                   nepali_share=args.nepali_share, nepali_dir=args.nepali_dir,
+                   mix=ANNEAL_MIX if args.mix == "anneal" else MIX)
 
 
 if __name__ == "__main__":
