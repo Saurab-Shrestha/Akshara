@@ -127,15 +127,18 @@ v1 was 16 × 768 with a 190 M embedding (Qwen vocab), pinned in
   - Recurrence runs in **fp32** even under bf16 autocast: the delta rule
     relies on near-cancellation `v − S·k`, which bf16's 8-bit mantissa
     destroys over hundreds of steps.
-  - **GPU path uses the FLA chunked Triton kernel** (`fla.layers.GatedDeltaNet`,
-    `mode="chunk"`) — ~20k tok/s on an A100 in Stage 1, vs ~140 tok/s for the
-    pure-Python recurrence. The Python loop is retained as the CPU/Mac fallback
-    (`use_fla=False`). Note: FLA is Triton/CUDA-only, so the trained weights
-    only load on a GPU box; CPU/Mac inference will need a weight-converter.
+  - **GPU path uses FLA's chunked Triton kernel** — ~20k tok/s on an A100 in
+    Stage 1, vs ~140 tok/s for the pure-Python recurrence. v2
+    (`gdn_impl: native`) keeps its own projections and calls only the kernel
+    (`chunk_gated_delta_rule`); the PyTorch recurrence computes the same math
+    (FLA's naive reference, tested), so GPU-trained weights load and decode on
+    CPU/Mac. v1 (`gdn_impl: fla_layer`) used FLA's whole `GatedDeltaNet`
+    module with its own weights and needs FLA + CUDA to load.
 - **Attention layers** (8): exact-recall checkpoints. GQA 16 query / 4 KV
   heads, RoPE (real cos/sin tables — complex tensors break DataParallel
-  buffer replication). Tables sized `max_seq_len × 4` (4096) to cover a
-  visual prefix + text.
+  buffer replication). Tables sized `max_seq_len × 4` to cover a visual
+  prefix + text; they are rebuilt from `max_seq_len` / `rope_theta` and not
+  saved, so weights load into a longer-context model (2k → 16k extension).
   - **QK-norm** (v2): Q and K are RMS-normalised per head before RoPE, which
     bounds the attention logits. This is the standard fix for loss spikes
     (Qwen3, OLMo-2, Gemma-3).
@@ -318,17 +321,16 @@ akshara/
     `Saurab0/akshara-pretrain-v2`; it defaults to off so smoke runs never upload,
     write-scoped token, `huggingface-cli login`). The HF namespace is
     **case-sensitive** (`Saurab0` ≠ `saurab0`).
-  - **Reinstall `flash-linear-attention==0.5.1` each new machine** — the
-    decoder's GDN weights only load with FLA present.
-  - **Regenerate the corpus on-box before each run** (it's not persisted).
-  - On a **free-tier allowance**, measure tok/s early and **trim `train_steps`
-    to land a clean cosine** inside the budget rather than get killed
-    mid-schedule.
-- **FLA is CUDA-only:** the trained model needs a GPU box to load/run. CPU/Mac
-  inference (and the Surya pipeline off-GPU) will need a validated
-  FLA-GDN → pure-Python-GDN weight converter — build at the inference stage.
-- **No KV cache yet:** `generate()` re-runs the decoder over the full prefix
-  per token (image is encoded once). Acceptable for eval at `max_new≤256`;
-  a KV/state cache is the biggest inference-speed win available.
+  - **Install `flash-linear-attention` on each GPU machine** for speed (v1
+    checkpoints also need it to load; v2 weights load anywhere).
+  - **Download the packed corpus each session** from the private
+    `Saurab0/akshara-corpus-v6` dataset (it's not persisted on the box).
+  - On a **free-tier allowance**, measure tok/s early and **set `train_steps`
+    so the WSD decay lands inside the budget**; the pre-decay checkpoint lets a
+    finished run be extended later.
+- **Cached inference:** `generate()` keeps a KV cache for the attention layers
+  and the GDN memory state, so each new token is one step; the image is
+  encoded once. `src/speculative.py` adds speculative decoding (draft model
+  with the same tokenizer; greedy output identical to the target's).
 - **Surya API drift:** `src/pipeline.py` imports surya lazily and pins
   loosely; check `surya-ocr` version if layout calls break.

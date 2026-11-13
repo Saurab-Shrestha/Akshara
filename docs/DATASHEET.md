@@ -5,7 +5,7 @@ Akshara's tokenizer and language model. Format follows *Datasheets for
 Datasets* (Gebru et al., 2021). This file is the source for the dataset card
 and the dataset paper — **update it as the data is built**, not afterwards.
 
-Status: **draft, 2026-11-13.** Full build `corpus_v5` done: 12.58B chars, 3.19B train tokens (48k tokenizer), private HF repo `Saurab0/akshara-corpus-v5`. Numbers marked TODO come from the full build
+Status: **draft, 2026-11-13.** Full build `corpus_v5` done: 12.58B chars, 3.19B train tokens (48k tokenizer), private HF repo `Saurab0/akshara-corpus-v5`. `corpus_v6` (30B chars) is building → `Saurab0/akshara-corpus-v6`. Numbers marked TODO come from the full build
 (`scripts/prepare_data.py`) and from the native-speaker audit (§3.6).
 
 ---
@@ -33,7 +33,7 @@ tokenizer studies.
 `{"text": "...", "lang": "<ISO 639-3>"}` (plus `"source"` for hand-collected
 subsets). Training also uses a packed uint16 token version (`*.bin`).
 
-### 2.1 Main mix (character budget, default 12B chars ≈ 3.4B tokens)
+### 2.1 Main mix (character budget; corpus_v6 = 30B chars ≈ 7.6B tokens)
 
 | Source | Lang | Share | License |
 |---|---|---|---|
@@ -197,3 +197,4 @@ commercial use.
 | Version | Date | Change |
 |---|---|---|
 | v5-draft | 2026-11-12 | Main mix + FineWeb-2/Wikipedia minority languages, script filter, Newari schema fix |
+| v6 (building) | 2026-11-13 | 30B chars; code 9% + The Stack JSON/YAML/Markdown 1%, FineMath 6%, Cosmopedia 4%, FineWeb-2 hi 13%; full BPCC (seed + daily + mined); repeated n-gram filter at packing; same 48k tokenizer |

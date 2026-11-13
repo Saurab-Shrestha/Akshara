@@ -133,6 +133,11 @@ out = F.scaled_dot_product_attention(
   without `repeat_interleave` copies.
 - The self-check asserts SDPA matches `_reference_attention`, and that v1
   checkpoints (which saved `causal_mask`) still load.
+- **KV cache.** `forward(x, cos, sin, cache=...)` appends this call's K and V
+  to `cache["k"]`, `cache["v"]` and attends over all of them. One new token
+  needs no mask (it may see everything); several new tokens on top of a cache
+  (speculative verification) get a causal mask offset by the cached length.
+  The caller passes the RoPE rows for the new positions.
 
 ---
 

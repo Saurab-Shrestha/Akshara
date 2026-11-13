@@ -36,10 +36,11 @@ For full documents, pretrained Surya layout/table models split the page into reg
 
 | Stage | Script | What trains | Data | Status |
 |---|---|---|---|---|
-| 0 — Corpus | `prepare_data.py` | — | FineWeb-2 ne/hi/mr/sa 60% · FineWeb-Edu 30% · FineMath 3% · Wikipedia 7%, ~12B chars | code ✅ |
+| 0 — Corpus | `prepare_data.py` | — | `corpus_v6`, 30B chars ≈ 7.6B tokens: FineWeb-2 ne/hi/mr/sa 35% · Nepali extras (HPLT, IndicCorp, FinePDFs, GlotCC) 12% · FineWeb-Edu 24% · code 9% + JSON/YAML/Markdown 1% · FineMath 6% · Cosmopedia 4% · Wikipedia 7% · parallel (BPCC, OPUS) 2% · plus Nepal's minority languages | building |
 | 1 — Tokenizer | `train_tokenizer.py` | 48k byte-level BPE | corpus sample | code ✅ |
 | 2 — Pack | `tokenize_corpus.py` | — | corpus → uint16 `.bin` | code ✅ |
-| 3 — Pretrain | `pretrain.py` | decoder | ~3.2B tokens (Chinchilla: 8.5B) | code ✅, **run next** |
+| 3 — Pretrain | `pretrain.py` | decoder | ~8.7B tokens at 2k context, WSD + anneal mix (Chinchilla ≈ 8.9B) | code ✅, **run next** |
+| 3b — Long context | `pretrain.py` | decoder | 2k → 16k, ~0.4B tokens of long docs, RoPE base 10k → 1M | config ✅ |
 | 4 — Align | to build | connector | image–caption pairs (LLaVA-Pretrain) | designed |
 | 5 — Instruct | to build | connector + decoder | VQA, doc QA, OCR (ocr-mlt-50m, Mozhi-LR) | designed |
 
@@ -99,27 +100,39 @@ python scripts/collect_nepali.py --list        # sources, licenses, configs
 python scripts/collect_nepali.py --sources hplt2,indiccorp,finepdfs
 python scripts/collect_nepali.py               # all five -> data/nepali/*.jsonl
 
-# 0b. corpus: ~12B chars ≈ 3.4B tokens, ~30 GB JSONL (use --total_chars 30e9 for Chinchilla 8.5B)
-#     --nepali_share (default 0.15) is carved out of fineweb2/ne; raise it for a
-#     more Nepali-heavy model (0.30 retires FineWeb-2 Nepali entirely).
-PYTHONPATH=. python scripts/prepare_data.py --out_dir data/corpus_v5 --nepali_share 0.20
+# 0b–2. one command: corpus → (tokenizer, only if missing) → packed .bin → private HF dataset.
+#     Resumable per source; a watchdog restarts the data step if an HF stream hangs.
+TOTAL_CHARS=30e9 NEPALI_SHARE=0.12 OUT=data/corpus_v6 HF_REPO=Saurab0/akshara-corpus-v6 \
+    nohup caffeinate -is scripts/build_corpus.sh > logs/build_v6.log 2>&1 &
+#     The 48k tokenizer was trained once on corpus_v5 and is committed (tokenizer/akshara-bpe/);
+#     RETRAIN_TOKENIZER=1 retrains it (new ids: old checkpoints become incompatible).
+#     Packing drops documents with a 1–13 token span repeated ≥32× in a row (loss-spike junk).
 
-# 1. tokenizer: prints chars/token vs Qwen; commit tokenizer/akshara-bpe/
-PYTHONPATH=. python scripts/train_tokenizer.py --input data/corpus_v5/train.jsonl \
-    --vocab_size 49152 --out_dir tokenizer/akshara-bpe --compare Qwen/Qwen3.5-0.8B
-
-# 2. pack into uint16 token files
-PYTHONPATH=. python scripts/tokenize_corpus.py --input data/corpus_v5/train.jsonl
-PYTHONPATH=. python scripts/tokenize_corpus.py --input data/corpus_v5/val.jsonl
+# 2b. anneal mix for the LR-decay phase (math/code/textbooks/parallel-heavy)
+PYTHONPATH=. python scripts/prepare_data.py --mix anneal --no_minority --total_chars 4.5e9 \
+    --nepali_share 0.10 --out_dir data/corpus_anneal
+PYTHONPATH=. python scripts/tokenize_corpus.py --input data/corpus_anneal/train.jsonl
 
 # 3. pretrain (multi-session; every checkpoint backed up to Saurab0/akshara-pretrain-v2)
-PYTHONPATH=. python scripts/pretrain.py --config configs/a100_pretrain_v2.json
+PYTHONPATH=. python scripts/pretrain.py --config configs/a100_pretrain_v2.json      # A100, bf16
+#    or configs/kaggle_t4_pretrain_v2.json (T4/P100, fp16 + GradScaler). Don't mix fp16/bf16 in one run.
 #    resume: --resume checkpoints/pretrain_v2.pt
+#    first: the comparison runs in configs/ablations/ (148M proxy, LR sweep, attention-only, AdamW)
+
+# 3b. long context 2k → 16k from the finished weights
+PYTHONPATH=. python scripts/tokenize_corpus.py --input data/corpus_v6/train.jsonl \
+    --min_tokens 4096 --out data/corpus_long/train.bin
+PYTHONPATH=. python scripts/pretrain.py --config configs/a100_longctx_v2.json
+
+# tests (CPU, ~1 min; also run in GitHub Actions)
+PYTHONPATH=. pytest -q tests/
 ```
 
-**Nepali collection** is append-safe: rerunning a source skips documents already on disk (`--restart` truncates). `--max_chars` caps a source — e.g. `--max_chars 3e9` on HPLT keeps ~9 GB of JSONL instead of all ~11B chars. Parquet shards are downloaded one at a time to `~/.cache/akshara_nepali` and deleted after reading; `data/nepali/MANIFEST.json` records license, volume and filter counts per source.
+**Nepali collection** is append-safe: rerunning a source skips documents already on disk (`--restart` truncates). Each source has a built-in cap (~4.3B chars total, ~13 GB JSONL); `--max_chars N` overrides it and `--max_chars -1` removes all caps (~19B chars, ~57 GB). Parquet shards are downloaded one at a time to `~/.cache/akshara_nepali` and deleted after reading; `data/nepali/MANIFEST.json` records license, volume and filter counts per source.
 
-**Compute warning:** 3.2B tokens at 443M params is ~8.5e18 FLOPs, so **~19 h on an A100 at 40% MFU, ~66 h at v1's measured efficiency**. Measure tok/s in the first 100 steps and set `train_steps` from that. See [ROADMAP_V2.md §3](docs/ROADMAP_V2.md).
+**Compute warning:** 8.7B tokens at 443M params is ~2.3e19 FLOPs: **~52 h on an A100 at 40% MFU, ~180 h at v1's measured efficiency (~12% MFU)**, roughly 300–700 h on Kaggle 2× T4. Measure tok/s in the first 100 steps and set `train_steps` from that. WSD makes a shorter run safe: the pre-decay checkpoint (`pretrain_v2_predecay_<step>.pt`) can be extended later. See [ROADMAP_V2.md §3](docs/ROADMAP_V2.md).
+
+**Inference:** `HybridDecoder.generate()` uses a KV cache for the attention layers and the fixed-size memory for the GDN layers (temperature / top-k / top-p). `src/speculative.py` does speculative decoding with a small draft model that shares the tokenizer (e.g. the 148M proxy).
 
 **Language eval** (works on v1 and v2 checkpoints):
 
@@ -183,11 +196,13 @@ that keeps a run safe (learned after losing a 9h run):
 
 - **Back up every checkpoint to HF** (`hf_repo` in the run config, e.g. `Saurab0/akshara-pretrain-v2`). The
   namespace is **case-sensitive** and the token must be **write**-scoped.
-- **Reinstall `flash-linear-attention==0.5.1`** on each new machine (the GDN
-  weights won't load without it).
-- **Corpus isn't persisted on the box.** Regenerate it, or better, push `data/corpus_v5/*.bin` to an HF dataset repo once and download it each session.
-- On a free-tier allowance, **measure tok/s early and trim `train_steps`** so the
-  cosine schedule lands cleanly inside the budget instead of getting killed.
+- **Install `flash-linear-attention`** on each GPU machine for speed. v2 GDN
+  weights (`gdn_impl: native`) load and run anywhere, CPU and Mac included;
+  only v1 checkpoints (`gdn_impl: fla_layer`) need FLA to load.
+- **Corpus isn't persisted on the box.** Download `train.bin` / `val.bin` from the
+  private `Saurab0/akshara-corpus-v6` dataset each session.
+- On a free-tier allowance, **measure tok/s early and set `train_steps`** so the
+  WSD decay lands inside the budget, and keep the pre-decay checkpoint to extend later.
 
 Pull the trained model anywhere:
 

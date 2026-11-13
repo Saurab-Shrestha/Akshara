@@ -53,10 +53,11 @@ Code: `scripts/train_tokenizer.py`, `scripts/tokenize_corpus.py`,
 ## 3. The stages
 
 ```
- 0. Corpus        prepare_data.py        → data/corpus_v5/{train,val}.jsonl
- 1. Tokenizer     train_tokenizer.py     → tokenizer/akshara-bpe/
- 2. Pack          tokenize_corpus.py     → data/corpus_v5/{train,val}.bin
- 3. Pretrain      pretrain.py            → Saurab0/akshara-pretrain-v2    (decoder only)
+ 0. Corpus        prepare_data.py        → data/corpus_v6/{train,val}.jsonl  (build_corpus.sh runs 0–2 + upload)
+ 1. Tokenizer     train_tokenizer.py     → tokenizer/akshara-bpe/  (trained once on corpus_v5, committed)
+ 2. Pack          tokenize_corpus.py     → data/corpus_v6/{train,val}.bin
+ 3. Pretrain      pretrain.py            → Saurab0/akshara-pretrain-v2    (decoder only, 2k context)
+ 3b. Long context pretrain.py            → 16k context
  4. Align         [to build]             → connector learns vision → token space
  5. Instruct      [to build]             → chat, VQA, doc QA, OCR
 ```
@@ -110,10 +111,14 @@ Data provenance, filters, audit and licensing are tracked in
 **[DATASHEET.md](DATASHEET.md)**, which is the basis for the dataset card and paper.
 
 ```bash
-PYTHONPATH=. python scripts/prepare_data.py --total_chars 12e9 --out_dir data/corpus_v5
+TOTAL_CHARS=30e9 NEPALI_SHARE=0.12 OUT=data/corpus_v6 HF_REPO=Saurab0/akshara-corpus-v6 \
+    nohup caffeinate -is scripts/build_corpus.sh > logs/build_v6.log 2>&1 &
 ```
-12e9 chars ≈ 3.4B tokens ≈ 30 GB of JSONL. For Chinchilla-optimal 443M
-(~8.9B tokens) use `--total_chars 30e9`.
+30e9 chars ≈ 7.6B tokens (3.9 chars/token measured on corpus_v5) ≈ 60 GB of
+JSONL, ~8.7B with the anneal set: about Chinchilla for 443M. Each source is
+written to `out_dir/parts/` with a `.done` marker, so a rerun after a crash or
+an HF stream hang resumes at the interrupted source; `build_corpus.sh`
+restarts the data step automatically after 15 minutes without output.
 
 ### Stage 1 — Tokenizer (`scripts/train_tokenizer.py`)
 
@@ -126,6 +131,7 @@ them off). Special tokens reserved now: `<|bos|> <|eos|> <|pad|> <|image|>
 PYTHONPATH=. python scripts/train_tokenizer.py --input data/corpus_v5/train.jsonl \
     --vocab_size 49152 --out_dir tokenizer/akshara-bpe --compare Qwen/Qwen3.5-0.8B
 ```
+Trained once on corpus_v5 and reused for v6: retraining would change the ids.
 **Vocab = 48k (49,152)**, chosen over 32k: 4–11% better chars/token on every
 language at about equal compute per character (comparison in
 [02_tokenizer.md](02_tokenizer.md)). Nepali 4.60 chars/token vs Qwen's 1.44. Commit
@@ -134,17 +140,19 @@ the resulting `tokenizer/akshara-bpe/` — every later stage depends on it.
 ### Stage 2 — Pack (`scripts/tokenize_corpus.py`)
 
 ```bash
-PYTHONPATH=. python scripts/tokenize_corpus.py --input data/corpus_v5/train.jsonl
-PYTHONPATH=. python scripts/tokenize_corpus.py --input data/corpus_v5/val.jsonl
+PYTHONPATH=. python scripts/tokenize_corpus.py --input data/corpus_v6/train.jsonl
+PYTHONPATH=. python scripts/tokenize_corpus.py --input data/corpus_v6/val.jsonl
 ```
-Each doc → `<|bos|> … <|eos|>`, concatenated into one uint16 file.
-`PackedTokenDataset` reads fixed 1024-token windows from a memmap: no padding,
-no RAM, no tokenization during training.
+Each doc → `<|bos|> … <|eos|>`, concatenated into one uint16 file. Documents
+where a 1–13 token span repeats ≥ 32 times in a row are dropped (OLMo 2's
+filter against loss spikes; 0.02% of corpus_v5 val). `PackedTokenDataset`
+reads random fixed windows (`max_seq_len`, 2048 for v2) from a memmap: no
+padding, no RAM, no tokenization during training.
 
 ### Stage 3 — Pretrain v2 (`scripts/pretrain.py`)
 
 ```bash
-pip install flash-linear-attention==0.5.1 && huggingface-cli login
+pip install flash-linear-attention && huggingface-cli login
 PYTHONPATH=. python scripts/pretrain.py --config configs/a100_pretrain_v2.json
 # new session: pull pretrain_v2.pt from Saurab0/akshara-pretrain-v2, then
 PYTHONPATH=. python scripts/pretrain.py --config configs/a100_pretrain_v2.json \
@@ -152,9 +160,9 @@ PYTHONPATH=. python scripts/pretrain.py --config configs/a100_pretrain_v2.json \
 ```
 
 Recipe: Muon (`adjust_lr_fn="match_rms_adamw"`, so one lr drives both
-optimizers), wd 0.1, 98k tokens/step (8 × 1024 × 12), bf16 + FLA,
+optimizers), wd 0.1, 98k tokens/step (4 × 2048 × 12), bf16 + FLA,
 90k steps ≈ 8.9B tokens on `corpus_v6`. No weight decay on the tied embedding,
-z-loss 1e-5, random 1024-token windows (sequence-level shuffle) — all per the
+z-loss 1e-5, random 2048-token windows (sequence-level shuffle) — all per the
 [Smol Training Playbook](https://huggingface.co/spaces/HuggingFaceTB/smol-training-playbook).
 **WSD schedule:** 2k warmup (~2%), flat at
 4e-4, then linear decay to 4e-5 over the last 15% of steps. During that decay
@@ -179,11 +187,12 @@ pushed to HF). To extend a finished run: `--resume` from that file with a larger
 
 | Tokens | FLOPs | at v1's measured efficiency (~36 TFLOP/s) | at 40% MFU (~125 TFLOP/s) |
 |---|---|---|---|
-| 3.2B (this config) | 8.5e18 | **~66 h** | ~19 h |
-| 8.9B (Chinchilla) | 2.4e19 | ~180 h | ~52 h |
+| 3.2B (corpus_v5) | 8.5e18 | ~66 h | ~19 h |
+| 8.7B (this config) | 2.3e19 | **~180 h** | ~52 h |
 
-v1 ran at roughly 12% MFU; the smaller vocab, fused attention, and
-`compile: true` should raise it, but **measure tok/s in the first 100 steps**
+On Kaggle 2× T4 (fp16, gradient checkpointing) expect roughly 300–700 h.
+v1 ran at roughly 12% MFU; the smaller vocab, fused attention, chunked
+cross-entropy and `compile: true` should raise it, but **measure tok/s in the first 100 steps**
 and set `train_steps` from that. This is a multi-session run — the HF backup
 on every save is what makes it survivable. If the budget can't cover it, the
 fallback is a 768 × 20 config (163M, ~3× cheaper).
