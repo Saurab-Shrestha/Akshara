@@ -21,9 +21,15 @@ step() { echo; echo "=== $(date '+%F %T') $*"; }
 step "1/4 corpus ($TOTAL_CHARS chars) -> $OUT"
 $PY -u scripts/prepare_data.py --total_chars "$TOTAL_CHARS" --out_dir "$OUT" --nepali_share "$NEPALI_SHARE"
 
-step "2/4 tokenizer (48k) -> tokenizer/akshara-bpe"
-$PY -u scripts/train_tokenizer.py --input "$OUT/train.jsonl" --vocab_size 49152 \
-    --sample_bytes "$SAMPLE_BYTES" --out_dir tokenizer/akshara-bpe --compare Qwen/Qwen3.5-0.8B
+# The tokenizer is committed and every checkpoint depends on its ids, so it is
+# only retrained when missing or when RETRAIN_TOKENIZER=1.
+if [[ ! -f tokenizer/akshara-bpe/tokenizer.json || ${RETRAIN_TOKENIZER:-0} == 1 ]]; then
+    step "2/4 tokenizer (48k) -> tokenizer/akshara-bpe"
+    $PY -u scripts/train_tokenizer.py --input "$OUT/train.jsonl" --vocab_size 49152 \
+        --sample_bytes "$SAMPLE_BYTES" --out_dir tokenizer/akshara-bpe --compare Qwen/Qwen3.5-0.8B
+else
+    step "2/4 tokenizer: reusing tokenizer/akshara-bpe"
+fi
 
 step "3/4 pack -> $OUT/{train,val}.bin"
 $PY -u scripts/tokenize_corpus.py --input "$OUT/val.jsonl" --tokenizer tokenizer/akshara-bpe

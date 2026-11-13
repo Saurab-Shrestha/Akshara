@@ -72,13 +72,13 @@ QUALITY_THRESHOLD = 3
 # Optional 6th field = train_only (license doesn't allow republishing).
 MIX = [
     ("fineweb2/ne",  "fineweb2", "npi_Deva", 0.30, "npi"),
-    ("fineweb2/hi",  "fineweb2", "hin_Deva", 0.19, "hin"),   # bridge language for ne/mai/bho/awa
+    ("fineweb2/hi",  "fineweb2", "hin_Deva", 0.13, "hin"),   # bridge language for ne/mai/bho/awa
     ("fineweb2/mr",  "fineweb2", "mar_Deva", 0.03, "mar"),
     ("fineweb2/sa",  "fineweb2", "san_Deva", 0.01, "san"),
     ("fineweb-edu",  "edu",      None,       0.24, "eng"),
-    ("code",         "code",     None,       0.07, "code"),  # code improves NL reasoning (Aryabumi et al. 2024)
-    ("finemath",     "math",     None,       0.04, "eng"),
-    ("cosmopedia",   "cosmo",    None,       0.03, "eng"),   # synthetic textbooks / step-by-step explanations
+    ("code",         "code",     None,       0.10, "code"),  # code improves NL reasoning (Aryabumi et al. 2024)
+    ("finemath",     "math",     None,       0.06, "eng"),
+    ("cosmopedia",   "cosmo",    None,       0.04, "eng"),   # synthetic textbooks / step-by-step explanations
     # Parallel text (~1% total; each source is capped by how much exists).
     # Tags like "eng-npi" keep pairs out of per-language stats and tokenizer floors.
     # BPCC (ai4bharat): "subdir+subdir/lang". Human = seed + daily (CC-BY-4.0/CC0);

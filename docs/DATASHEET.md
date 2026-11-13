@@ -38,12 +38,12 @@ subsets). Training also uses a packed uint16 token version (`*.bin`).
 | Source | Lang | Share | License |
 |---|---|---|---|
 | FineWeb-2 `npi_Deva` | npi | 30% | ODC-By 1.0 |
-| FineWeb-2 `hin_Deva` | hin | 19% | ODC-By 1.0 |
+| FineWeb-2 `hin_Deva` | hin | 13% | ODC-By 1.0 |
 | FineWeb-2 `mar_Deva` / `san_Deva` | mar / san | 3% / 1% | ODC-By 1.0 |
 | FineWeb-Edu (EduScore ≥ 3) | eng | 24% | ODC-By 1.0 |
-| codeparrot-clean (Python; MIT/Apache/BSD/ISC/MPL/CC0/Unlicense files only; quality-filtered) | code | 7% | per-file permissive |
-| FineMath `finemath-4plus` | eng | 4% | ODC-By 1.0 |
-| Cosmopedia v2 (smollm-corpus) | eng | 3% | ODC-By 1.0 |
+| codeparrot-clean (Python; MIT/Apache/BSD/ISC/MPL/CC0/Unlicense files only; quality-filtered) | code | 10% | per-file permissive |
+| FineMath `finemath-4plus` | eng | 6% | ODC-By 1.0 |
+| Cosmopedia v2 (smollm-corpus) | eng | 4% | ODC-By 1.0 |
 | BPCC seed + daily en↔npi / mai / sat (human-translated) | eng-npi / eng-mai / eng-sat | 0.3% / 0.15% / 0.15% | CC0 / CC-BY-4.0 |
 | BPCC mined en↔npi (NLLB, Samanantar, comparable) / en↔mai (NLLB) | eng-npi / eng-mai | 0.95% / 0.05% | CC0 (packaging) |
 | OPUS-100 en↔ne | eng-npi | 0.4% | unknown → train-only |
