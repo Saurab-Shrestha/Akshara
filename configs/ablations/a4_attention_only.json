@@ -1,0 +1,7 @@
+{
+  "_comment": "Architecture: every layer is attention. 18 layers \u2248 113M non-embedding vs the hybrid's 110M (+2.6%). Run at the best LR from a1-a3 (pass --lr/--min_lr).",
+  "attn_every": 1,
+  "n_layers": 18,
+  "out_ckpt": "checkpoints/ablations/a4_attention_only.pt",
+  "log_dir": "logs/ablations/a4_attention_only"
+}

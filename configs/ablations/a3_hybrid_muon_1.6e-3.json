@@ -1,0 +1,7 @@
+{
+  "_comment": "LR sweep, high end. Watch for loss spikes / divergence (playbook: Muon is LR-sensitive).",
+  "lr": 0.0016,
+  "min_lr": 0.00016,
+  "out_ckpt": "checkpoints/ablations/a3_hybrid_muon_1.6e-3.pt",
+  "log_dir": "logs/ablations/a3_hybrid_muon_1.6e-3"
+}
