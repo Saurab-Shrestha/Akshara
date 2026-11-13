@@ -61,8 +61,23 @@ main-language sample, or all of its text if it has less):
 The cost is about −1.5% on the main languages. Small-language gains are probably
 inflated: their text is mostly Bible translation and they have only 2–6 held-out docs.
 
-**v2 uses 48k (49,152) with the 1.5% floor.** These numbers come from a 200M-char test corpus that
-lacked the Newari fix and the hand-collected sources. Re-measure on the full corpus.
+**v2 uses 48k (49,152) with the 1.5% floor.**
+
+### Final tokenizer (2026-11-13, full `corpus_v5`, 1 GB sample)
+
+| Lang | **akshara 48k** | Qwen 248k |
+|---|---|---|
+| Nepali | **4.59** | 1.45 |
+| Hindi / Marathi | **3.86 / 3.71** | 1.61 / 1.44 |
+| English | 4.21 | 4.56 |
+| Code (Python) | 3.38 | 3.87 |
+| Maithili / Bhojpuri / Newari | **3.51 / 3.43 / 3.38** | ~1.4 |
+| Santali (Ol Chiki) | **3.08** | 0.43 |
+| Limbu / Sunwar / Tamang / Sherpa | **3.19 / 3.51 / 3.88 / 3.85** | 0.56 / 1.26 / 1.31 / 1.41 |
+| en↔ne parallel | **3.79** | 2.14 |
+
+English and code are ~8–13% worse than Qwen. That is the price of a vocabulary
+built mostly for Devanagari. Packed corpus: 3.19B train tokens and 15.5M val tokens.
 
 ---
 

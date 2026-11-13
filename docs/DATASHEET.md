@@ -5,7 +5,7 @@ Akshara's tokenizer and language model. Format follows *Datasheets for
 Datasets* (Gebru et al., 2021). This file is the source for the dataset card
 and the dataset paper — **update it as the data is built**, not afterwards.
 
-Status: **draft, 2026-11-12.** Numbers marked TODO come from the full build
+Status: **draft, 2026-11-13.** Full build `corpus_v5` done: 12.58B chars, 3.19B train tokens (48k tokenizer), private HF repo `Saurab0/akshara-corpus-v5`. Numbers marked TODO come from the full build
 (`scripts/prepare_data.py`) and from the native-speaker audit (§3.6).
 
 ---
@@ -49,28 +49,28 @@ subsets). Training also uses a packed uint16 token version (`*.bin`).
 | Nepali extras from `scripts/collect_nepali.py` (HPLT 2.0, IndicCorpV2, FinePDFs, GlotCC, DCAD) | npi | `--nepali_share` (default 15%, carved out of FineWeb-2 ne) | per source |
 | Wikipedia ne / hi / en (20231101) | npi / hin / eng | 3% / 2% / 2% | CC BY-SA 4.0 |
 
-### 2.2 Languages of Nepal (all available text, repeated 4×)
+### 2.2 Languages of Nepal (all available text, repeated per language)
 
-Raw sizes: FineWeb-2 compressed parquet (train split). Docs/chars after the
-script filter (§3.3) come from the test build (`data/corpus_test`, 2026-11-12).
-TODO: replace with the full-build numbers.
+Full build `corpus_v5` (2026-11-13). "Unique chars" is after the script filter
+and dedup, summed over FineWeb-2, Wikipedia and the hand-collected sources.
+Languages with ≥ ~100M chars are taken once and smaller ones are repeated up to 4×
+(Bible text 1×), see §3.
 
-| Language | ISO | Script | FineWeb-2 parquet | Docs kept | Chars kept | + Wikipedia |
-|---|---|---|---|---|---|---|
-| Maithili | mai | Devanagari | 48 MB | 22,787* | 68.3M* | ✓ |
-| Newari / Nepal Bhasa | new | Devanagari | 30 MB | TODO | TODO | ✓ |
-| Bhojpuri | bho | Devanagari | 26 MB | 18,467* | 36.5M* | ✓ (`bh`) |
-| Awadhi | awa | Devanagari | 3 MB | 1,902* | 4.5M* | ✓ |
-| Santali | sat | Ol Chiki | 3 MB | TODO | TODO | ✓ |
-| Tamang (Eastern) | taj | Devanagari | 1.0 MB | 338* | 1.9M* | — |
-| Tharu (Dangaura) | thl | Devanagari | 1.1 MB | 265* | 1.6M* | — |
-| Sherpa | xsr | Devanagari | 0.4 MB | 141* | 0.7M* | — |
-| Sunwar | suz | Devanagari | 0.4 MB | TODO | TODO | — |
-| Doteli | dty | Devanagari | <0.1 MB | TODO | TODO | ✓ |
-| Limbu | lif | Devanagari + Limbu | 0.5 + 0.2 MB | TODO | TODO | — |
-| Rai languages, Magar, Gurung | various | — | none | TODO (§2.3) | | — |
-
-\* before the script filter was added. Re-measure.
+| Language | ISO | Script | Unique chars | Repeats |
+|---|---|---|---|---|
+| Maithili | mai | Devanagari | 350M | 1× |
+| Newari / Nepal Bhasa | new | Devanagari | 220M | 1× |
+| Bhojpuri | bho | Devanagari | 140M | 1× |
+| Santali | sat | Ol Chiki | 46M | 4× |
+| Awadhi | awa | Devanagari | 41M | 4× |
+| Sunwar | suz | Devanagari | 16M | 4× |
+| Tamang (Eastern) | taj | Devanagari | 8M | 4× |
+| Limbu | lif | Devanagari + Limbu | 5M | 4× |
+| Doteli | dty | Devanagari | 3M | 4× |
+| Tharu (Dangaura) | thl | Devanagari | 2M | 4× |
+| Sherpa / Tharu (Rana) / Rawat | xsr / thr / rav | Devanagari | ~1M each | 4× |
+| Magar, Bantawa, Dhimal, Kulung, Thakali, … | mgp / ybh / dhi / klr / the / … | — | < 0.5M each | 4× |
+| Other Rai languages, Gurung, Chepang | various | — | none | — |
 
 ### 2.3 Hand-collected sources
 
@@ -176,7 +176,7 @@ blocking AI crawlers) are **excluded unless the publisher gives written permissi
 also restrict commercial use of the resulting model. Revisit before any
 commercial use.
 
-- **Where:** Hugging Face dataset repo (TODO: name), plus the rebuild scripts in this repo.
+- **Where:** Hugging Face dataset repo (currently private `Saurab0/akshara-corpus-v5`, packed tokens + tokenizer only), plus the rebuild scripts in this repo.
 - **License:** follows the most restrictive license in each subset: ODC-By for the FineWeb
   family, CC BY-SA 4.0 for Wikipedia. Subsets that can't be redistributed
   (some Bible translations, archives) ship as **rebuild scripts only**.
