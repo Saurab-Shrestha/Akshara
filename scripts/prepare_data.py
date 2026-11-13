@@ -63,6 +63,7 @@ import hashlib
 import json
 import os
 import random
+import re
 import shutil
 import time
 import zlib
@@ -345,6 +346,11 @@ def _row(text: str, lang: str, train_only: bool = False) -> str:
     return json.dumps(row, ensure_ascii=False) + "\n"
 
 
+def doc_key(text: str) -> bytes:
+    """Exact-duplicate key: first 400 chars, whitespace-normalised."""
+    return hashlib.blake2b(re.sub(r"\s+", " ", text.strip())[:400].encode("utf-8"), digest_size=8).digest()
+
+
 def nepali_jobs(nepali_dir: str, share: float) -> list[tuple]:
     """Resolve the NEPALI registry to concrete (label, kind, path, share, lang,
     train_only) jobs. Missing files are skipped and the remaining weights are
@@ -396,8 +402,21 @@ def prepare_corpus(total_chars: float, out_dir: str, quality: int,
     parts = os.path.join(out_dir, "parts")
     os.makedirs(parts, exist_ok=True)
     stats = {}
+    # HPLT / GlotCC / ... and FineWeb-2 all come from CommonCrawl: on corpus_v6,
+    # 30% of HPLT and 15% of GlotCC docs were exact copies of FineWeb-2 Nepali
+    # docs. The nepali/* sources skip anything already in the fineweb2/ne part.
+    # ponytail: exact (prefix) dedup only; MinHash near-dedup would catch more.
+    fw_keys: set[bytes] | None = None
     for label, kind, arg, share, lang, nc in jobs:
         stem = os.path.join(parts, label.replace("/", "__"))
+        if label.startswith("nepali/") and fw_keys is None:
+            fw_keys = set()
+            fw = os.path.join(parts, "fineweb2__ne")
+            for ext in (".train", ".val"):
+                if os.path.exists(fw + ext):
+                    with open(fw + ext, encoding="utf-8") as f:
+                        fw_keys.update(doc_key(json.loads(line)["text"]) for line in f)
+            print(f"[nepali] dedup against {len(fw_keys):,} fineweb2/ne docs")
         if os.path.exists(stem + ".done"):
             stats[label] = tuple(json.load(open(stem + ".done")))
             print(f"[{label}] done earlier: {stats[label][1]/1e6:,.0f}M chars")
@@ -405,10 +424,14 @@ def prepare_corpus(total_chars: float, out_dir: str, quality: int,
         budget = int(total_chars * share)
         got, docs, t0 = 0, 0, time.time()
         print(f"[{label}] target {budget/1e6:,.0f}M chars")
+        dup = 0
         with open(stem + ".train", "w", encoding="utf-8") as ftr, \
              open(stem + ".val", "w", encoding="utf-8") as fva:
             try:
                 for text in stream_texts(kind, arg, quality):
+                    if fw_keys is not None and label.startswith("nepali/") and doc_key(text) in fw_keys:
+                        dup += 1
+                        continue
                     (fva if is_val(text) else ftr).write(_row(text, lang, nc))
                     got += len(text)
                     docs += 1
@@ -418,6 +441,8 @@ def prepare_corpus(total_chars: float, out_dir: str, quality: int,
                         break
             except Exception as e:
                 print(f"    [warn] {label} failed after {docs:,} docs: {e}")
+        if dup:
+            print(f"    skipped {dup:,} docs already in fineweb2/ne")
         if got < budget:
             print(f"    [warn] {label} exhausted at {got/1e6:,.0f}M / {budget/1e6:,.0f}M chars")
         stats[label] = (docs, got)
