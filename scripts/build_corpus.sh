@@ -3,7 +3,7 @@
 #
 #   nohup caffeinate -is scripts/build_corpus.sh > logs/build_v5.log 2>&1 &
 #
-# Env overrides: TOTAL_CHARS (default 12e9 ≈ 3.4B tokens), NEPALI_SHARE (0.20),
+# Env overrides: SKIP_CORPUS=1 (reuse an assembled $OUT/train.jsonl), TOTAL_CHARS (default 12e9 ≈ 3.4B tokens), NEPALI_SHARE (0.20),
 # OUT (data/corpus_v5), HF_REPO (Saurab0/akshara-corpus-v5), SAMPLE_BYTES (1e9:
 # tokenizer sample, sized for a 16 GB machine).
 set -euo pipefail
@@ -18,6 +18,9 @@ SAMPLE_BYTES=${SAMPLE_BYTES:-1e9}
 PY=venv/bin/python
 step() { echo; echo "=== $(date '+%F %T') $*"; }
 
+if [[ ${SKIP_CORPUS:-0} == 1 ]]; then
+    step "1/4 corpus: reusing $OUT/train.jsonl"
+else
 step "1/4 corpus ($TOTAL_CHARS chars) -> $OUT"
 # HF streams can hang forever in an SSL read. prepare_data.py resumes per source,
 # so on a stall (no file under $OUT written for STALL_MIN minutes) kill and rerun.
@@ -35,6 +38,13 @@ for attempt in $(seq 1 30); do
     if wait $pid; then break; fi
     [[ $attempt == 30 ]] && { echo "[watchdog] giving up"; exit 1; }
 done
+fi
+
+# Near-duplicate Nepali docs (same story, different header/date): MinHash + LSH.
+# corpus_v6: 4.1% of Nepali docs. Writes line numbers; packing skips them.
+step "1b near-dedup (npi) -> $OUT/train.neardup.npy"
+[[ -f "$OUT/train.neardup.npy" ]] || \
+    $PY -u scripts/near_dedup.py --input "$OUT/train.jsonl" --drop_list "$OUT/train.neardup.npy" --langs npi --workers 6
 
 # The tokenizer is committed and every checkpoint depends on its ids, so it is
 # only retrained when missing or when RETRAIN_TOKENIZER=1.
@@ -48,7 +58,8 @@ fi
 
 step "3/4 pack -> $OUT/{train,val}.bin"
 $PY -u scripts/tokenize_corpus.py --input "$OUT/val.jsonl" --tokenizer tokenizer/akshara-bpe
-$PY -u scripts/tokenize_corpus.py --input "$OUT/train.jsonl" --tokenizer tokenizer/akshara-bpe
+$PY -u scripts/tokenize_corpus.py --input "$OUT/train.jsonl" --tokenizer tokenizer/akshara-bpe \
+    --skip_lines "$OUT/train.neardup.npy"
 
 step "4/4 upload -> $HF_REPO (private)"
 $PY -u - "$HF_REPO" "$OUT" <<'EOF'
