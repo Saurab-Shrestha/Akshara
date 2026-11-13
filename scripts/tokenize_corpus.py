@@ -65,6 +65,7 @@ def main():
     ap.add_argument("--out", default=None, help="default: input with .bin extension")
     ap.add_argument("--batch", type=int, default=2000)
     ap.add_argument("--max_repeats", type=int, default=32, help="repeated n-gram filter; 0 disables")
+    ap.add_argument("--skip_lines", help=".npy of input line numbers to skip (scripts/near_dedup.py --drop_list)")
     ap.add_argument("--min_tokens", type=int, default=0,
                     help="keep only docs with at least this many tokens (long-context stage data)")
     args = ap.parse_args()
@@ -98,7 +99,10 @@ def main():
 
     with open(args.input, encoding="utf-8") as f, open(out_path, "wb") as out:
         buf, langs = [], []
-        for line in f:
+        skip = set(np.load(args.skip_lines).tolist()) if args.skip_lines else set()
+        for i, line in enumerate(f):
+            if i in skip:
+                continue
             row = json.loads(line)
             buf.append(row["text"])
             langs.append(row.get("lang", "?"))

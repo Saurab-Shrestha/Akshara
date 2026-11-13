@@ -41,6 +41,7 @@ from __future__ import annotations
 import argparse
 import math
 import os
+import sys
 import time
 from contextlib import nullcontext
 
@@ -53,6 +54,7 @@ from config.loader import load_config
 from src.data.text_dataset import get_text_dataloader
 from src.models.hybrid_decoder import HybridDecoder
 from src.optim import build_optimizer
+from src.checkpoint import load_checkpoint, strip_prefixes
 
 
 # ---------------------------------------------------------------------------
@@ -124,7 +126,7 @@ def unwrap(model: nn.Module) -> nn.Module:
     """Strip DataParallel / torch.compile wrappers so state_dict keys carry no
     'module.' / '_orig_mod.' prefix and load into a plain HybridDecoder."""
     while True:
-        if isinstance(model, nn.DataParallel):
+        if isinstance(model, (nn.DataParallel, nn.parallel.DistributedDataParallel)):
             model = model.module
         elif hasattr(model, "_orig_mod"):
             model = model._orig_mod
@@ -177,7 +179,7 @@ def estimate_loss(
 
 
 def save_checkpoint(path: str, model: nn.Module, optimizer, step: int, cfg: PretrainConfig,
-                    scaler=None) -> None:
+                    scaler=None, extra: dict | None = None) -> None:
     """Save a portable checkpoint dict to ``path``, then optionally push to HF Hub."""
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     torch.save({
@@ -185,6 +187,7 @@ def save_checkpoint(path: str, model: nn.Module, optimizer, step: int, cfg: Pret
         "model_state_dict": unwrap(model).state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "scaler_state_dict": scaler.state_dict() if scaler is not None else None,
+        **(extra or {}),
         "config": vars(cfg),
     }, path)
     _push_to_hub(path, cfg, step)
@@ -223,7 +226,11 @@ def main() -> None:
     parser.add_argument("--config", type=str, default="configs/pretrain.json",
                         help="Path to stage JSON (default: configs/pretrain.json)")
     parser.add_argument("--resume", type=str, default=None,
-                        help="Path to a checkpoint to resume training from")
+                        help="checkpoint to resume from, or 'auto': out_ckpt if it exists, "
+                             "else download it from hf_repo, else start fresh")
+    parser.add_argument("--max_hours", type=float, default=None,
+                        help="save and exit cleanly after this many hours (e.g. 11.5 on Kaggle)")
+    parser.add_argument("--wandb_project", type=str, default=None)
     # Allow any PretrainConfig field to be overridden via --field value
     parser.add_argument("--train_path",  type=str,   default=None)
     parser.add_argument("--dev_path",    type=str,   default=None)
@@ -250,7 +257,27 @@ def main() -> None:
         torch.cuda.manual_seed_all(cfg.seed)
 
     device = cfg.device
-    print(f"[pretrain] config loaded | device={device} | steps={cfg.train_steps}")
+
+    # --- DDP (launched with torchrun): one process per GPU, each on its own
+    # shard of the data; gradients are averaged across GPUs in backward. The
+    # optimizer-step batch stays cfg.batch_size × cfg.grad_accum × max_seq_len
+    # tokens: grad_accum is split across the GPUs.
+    ddp = int(os.environ.get("WORLD_SIZE", "1")) > 1
+    rank, world = 0, 1
+    if ddp:
+        import torch.distributed as dist
+        dist.init_process_group("nccl" if torch.cuda.is_available() else "gloo")
+        rank, world = dist.get_rank(), dist.get_world_size()
+        if device.startswith("cuda"):
+            device = f"cuda:{int(os.environ['LOCAL_RANK'])}"
+            torch.cuda.set_device(device)
+        assert cfg.grad_accum % world == 0, f"grad_accum {cfg.grad_accum} not divisible by {world} GPUs"
+        if rank != 0:
+            sys.stdout = open(os.devnull, "w")   # only rank 0 prints; errors still reach stderr
+    master = rank == 0
+    grad_accum = cfg.grad_accum // world
+    print(f"[pretrain] config loaded | device={device} | steps={cfg.train_steps}"
+          + (f" | DDP × {world}" if ddp else ""))
     print(f"[pretrain] effective batch = {cfg.batch_size} × {cfg.grad_accum} = "
           f"{cfg.batch_size * cfg.grad_accum} sequences/step")
 
@@ -283,22 +310,34 @@ def main() -> None:
     model = model.to(device)
 
     # --- optional resume (before compile / DataParallel so keys match) ---
+    resume = args.resume
+    if resume == "auto":
+        resume = cfg.out_ckpt
+        if master and not os.path.exists(resume) and cfg.hf_repo:
+            try:
+                from huggingface_hub import hf_hub_download
+                hf_hub_download(cfg.hf_repo, os.path.basename(resume), repo_type="model",
+                                local_dir=os.path.dirname(resume) or ".")
+                print(f"[pretrain] downloaded {os.path.basename(resume)} from {cfg.hf_repo}")
+            except Exception as e:
+                print(f"[pretrain] no checkpoint on {cfg.hf_repo} ({type(e).__name__}); starting fresh")
+        if ddp:
+            dist.barrier()                       # other ranks wait for the download
     start_step = 0
     ck = None
-    if cfg.init_ckpt and not (args.resume and os.path.exists(args.resume)):
+    if cfg.init_ckpt and not (resume and os.path.exists(resume)):
         # New stage from earlier weights (e.g. 2k → 16k context): weights only.
         # RoPE tables are rebuilt from this config's max_seq_len / rope_theta.
-        init = torch.load(cfg.init_ckpt, map_location="cpu", weights_only=False)["model_state_dict"]
-        model.load_state_dict({k.removeprefix("_orig_mod.").removeprefix("module."): v for k, v in init.items()})
+        init = load_checkpoint(cfg.init_ckpt)["model_state_dict"]
+        model.load_state_dict(strip_prefixes(init))
         print(f"[pretrain] initialised weights from {cfg.init_ckpt}")
         del init
-    if args.resume and os.path.exists(args.resume):
-        ck = torch.load(args.resume, map_location="cpu", weights_only=False)
-        sd = {k.removeprefix("_orig_mod.").removeprefix("module."): v
-              for k, v in ck["model_state_dict"].items()}
-        model.load_state_dict(sd)
+    if resume and os.path.exists(resume):
+        ck = load_checkpoint(resume)
+        model.load_state_dict(strip_prefixes(ck["model_state_dict"]))
         start_step = ck.get("step", 0)
-        print(f"[pretrain] resumed from {args.resume} at step {start_step}")
+        print(f"[pretrain] resumed from {resume} at step {start_step}")
+    wandb_id = (ck or {}).get("wandb_run_id")
 
     # --- optimizer: built on the plain model (same param tensors as any wrapper) ---
     optimizer = build_optimizer(model, cfg, device)
@@ -324,9 +363,14 @@ def main() -> None:
     n_params = sum(p.numel() for p in model.parameters())
     print(f"[pretrain] model params: {n_params:,} (~{n_params / 1e6:.1f}M)")
 
-    # --- multi-GPU: wrap in DataParallel if multiple GPUs available ---
+    # --- multi-GPU: DDP under torchrun, else DataParallel if several GPUs are visible ---
     n_gpus = torch.cuda.device_count() if device == "cuda" else 0
-    if n_gpus > 1:
+    if ddp:
+        model = nn.parallel.DistributedDataParallel(
+            model, device_ids=[torch.cuda.current_device()] if device.startswith("cuda") else None)
+    elif n_gpus > 1:
+        print(f"[pretrain] {n_gpus}× GPU — DataParallel. Faster: torchrun --nproc_per_node {n_gpus} scripts/pretrain.py ...")
+        model = nn.DataParallel(model)
         print(f"[pretrain] {n_gpus}× GPU detected — using DataParallel (effective batch ×{n_gpus})")
         model = nn.DataParallel(model)
     raw_model = unwrap(model)  # for state_dict saving
@@ -334,25 +378,48 @@ def main() -> None:
     # --- data ---
     cur_path = data_path_at(start_step, cfg)
     train_loader = get_text_dataloader(
-        cur_path, tokenizer, cfg.batch_size, cfg.max_seq_len, shuffle=True
+        cur_path, tokenizer, cfg.batch_size, cfg.max_seq_len, shuffle=True, distributed=ddp
     )
     dev_loader = get_text_dataloader(
         cfg.dev_path, tokenizer, cfg.batch_size, cfg.max_seq_len, shuffle=False
-    ) if os.path.exists(cfg.dev_path) else None
+    ) if master and os.path.exists(cfg.dev_path) else None
 
+    epoch = 0
     train_iter = iter(train_loader)
 
-    # --- log dir + TensorBoard (optional — falls back to no-op if unavailable) ---
-    os.makedirs(cfg.log_dir, exist_ok=True)
-    try:
-        from torch.utils.tensorboard import SummaryWriter
-        writer = SummaryWriter(log_dir=cfg.log_dir)
-    except Exception:
-        class _NoOpWriter:
-            def add_scalar(self, *a, **kw): pass
-            def close(self): pass
-        writer = _NoOpWriter()
-        print("[pretrain] TensorBoard unavailable — console logging only")
+    # --- logging: TensorBoard + optional W&B, rank 0 only ---
+    class _NoOpWriter:
+        def add_scalar(self, *a, **kw): pass
+        def close(self): pass
+    writer, wb = _NoOpWriter(), None
+    if master:
+        os.makedirs(cfg.log_dir, exist_ok=True)
+        try:
+            from torch.utils.tensorboard import SummaryWriter
+            writer = SummaryWriter(log_dir=cfg.log_dir)
+        except Exception:
+            print("[pretrain] TensorBoard unavailable — console logging only")
+        if cfg.wandb_project:
+            try:
+                import wandb
+                # Same run id across sessions: a resumed Kaggle session continues the same curves.
+                import uuid
+                wandb_id = wandb_id or uuid.uuid4().hex[:8]
+                wb = wandb.init(project=cfg.wandb_project, id=wandb_id, resume="allow",
+                                name=os.path.splitext(os.path.basename(cfg.out_ckpt))[0], config=vars(cfg))
+            except Exception as e:
+                print(f"[pretrain] W&B disabled ({type(e).__name__}: {e})")
+
+    def log_scalars(d: dict, step: int) -> None:
+        for k, v in d.items():
+            writer.add_scalar(k, v, step)
+        if wb is not None:
+            wb.log(d, step=step)
+
+    def save(path, step):
+        if master:
+            save_checkpoint(path, raw_model, optimizer, step, cfg, scaler,
+                            extra={"wandb_run_id": wandb_id} if wb is not None else None)
 
     # --- training loop ---
     model.train()
@@ -360,6 +427,7 @@ def main() -> None:
     run_start   = time.perf_counter()
     tokens_per_step = cfg.batch_size * cfg.max_seq_len * cfg.grad_accum
     accum_loss  = 0.0
+    stopped_early = False
 
     for step in range(start_step, cfg.train_steps):
         lr = lr_at(step, cfg)
@@ -372,33 +440,38 @@ def main() -> None:
         predecay = f"{os.path.splitext(cfg.out_ckpt)[0]}_predecay_{step}.pt"
         if (cfg.schedule == "wsd" and step == decay_start(cfg.warmup_steps, cfg.train_steps, cfg.decay_frac)
                 and not os.path.exists(predecay)):
-            save_checkpoint(predecay, raw_model, optimizer, step, cfg, scaler)
+            save(predecay, step)
             print(f"  [ckpt] pre-decay checkpoint → {predecay} (step {step})")
 
         if (path := data_path_at(step, cfg)) != cur_path:
             print(f"[pretrain] step {step}: LR decay starts, switching data {cur_path} → {path}")
             cur_path = path
-            train_loader = get_text_dataloader(path, tokenizer, cfg.batch_size, cfg.max_seq_len, shuffle=True)
+            train_loader = get_text_dataloader(path, tokenizer, cfg.batch_size, cfg.max_seq_len,
+                                               shuffle=True, distributed=ddp)
             train_iter = iter(train_loader)
 
         optimizer.zero_grad(set_to_none=True)
         accum_loss = 0.0
 
-        for micro in range(cfg.grad_accum):
+        for micro in range(grad_accum):
             try:
                 input_ids, targets = next(train_iter)
             except StopIteration:
+                epoch += 1
+                if hasattr(train_loader.sampler, "set_epoch"):
+                    train_loader.sampler.set_epoch(epoch)
                 train_iter = iter(train_loader)
                 input_ids, targets = next(train_iter)
 
             input_ids = input_ids.to(device)
             targets   = targets.to(device)
 
-            with amp_context(cfg.use_amp, cfg.amp_dtype, device):
+            # DDP: skip the gradient all-reduce on all but the last micro-batch
+            sync = nullcontext() if not ddp or micro == grad_accum - 1 else model.no_sync()
+            with sync, amp_context(cfg.use_amp, cfg.amp_dtype, device):
                 _, loss = model(input_ids, targets)
                 # DataParallel returns one loss per GPU — reduce to scalar
-                loss = loss.mean() / cfg.grad_accum
-
+                loss = loss.mean() / grad_accum
             scaler.scale(loss).backward()
             accum_loss += loss.item()
 
@@ -411,6 +484,10 @@ def main() -> None:
 
         # --- logging every 20 steps ---
         if step % 20 == 0:
+            if ddp:                                   # mean loss over GPUs (every rank calls this)
+                t = torch.tensor([accum_loss], device=device)
+                dist.all_reduce(t)
+                accum_loss = t.item() / world
             dt    = time.perf_counter() - t0
             tok_s = tokens_per_step * 20 / dt if step > start_step else 0.0
             t0    = time.perf_counter()
@@ -425,34 +502,53 @@ def main() -> None:
                   f"gnorm {grad_norm:.2f} | {tok_s:,.0f} tok/s | "
                   f"elapsed {elapsed/3600:.1f}h | eta {eta_str}")
 
-            writer.add_scalar("train/loss",      accum_loss,      step)
-            writer.add_scalar("train/lr",         lr,              step)
-            writer.add_scalar("train/grad_norm",  grad_norm.item(), step)
-            writer.add_scalar("train/tok_per_sec", tok_s,          step)
+            scalars = {"train/loss": accum_loss, "train/lr": lr, "train/grad_norm": grad_norm.item(),
+                       "train/tok_per_sec": tok_s}
+            if scaler.is_enabled():
+                scalars["train/loss_scale"] = scaler.get_scale()   # drops = fp16 overflow, step skipped
+            if torch.cuda.is_available() and device.startswith("cuda"):
+                scalars["sys/gpu_mem_gb"] = torch.cuda.max_memory_allocated(device) / 1e9
+            log_scalars(scalars, step)
 
         # --- periodic eval ---
         if step > start_step and step % cfg.eval_steps == 0:
-            if dev_loader is not None:
+            if dev_loader is not None:   # rank 0 only; the others wait at the next all-reduce
+                eval_model = raw_model if ddp else model
                 dev_iter = iter(dev_loader)
-                dev_loss = estimate_loss(model, dev_iter, cfg, cfg.eval_iters, device)
+                dev_loss = estimate_loss(eval_model, dev_iter, cfg, cfg.eval_iters, device)
                 train_iter_eval = iter(train_loader)
-                train_loss = estimate_loss(model, train_iter_eval, cfg, cfg.eval_iters, device)
+                train_loss = estimate_loss(eval_model, train_iter_eval, cfg, cfg.eval_iters, device)
                 ppl = math.exp(min(dev_loss, 20))
                 print(f"  [eval] step {step} | train {train_loss:.4f} | dev {dev_loss:.4f} | ppl {ppl:.2f}")
-                writer.add_scalar("eval/train_loss", train_loss, step)
-                writer.add_scalar("eval/dev_loss",   dev_loss,   step)
-                writer.add_scalar("eval/perplexity", ppl,        step)
+                log_scalars({"eval/train_loss": train_loss, "eval/dev_loss": dev_loss,
+                             "eval/perplexity": ppl}, step)
 
         # --- periodic checkpoint ---
         if step > start_step and step % cfg.save_every == 0:
             # step+1: this step is done — resume should start at the next one
-            save_checkpoint(cfg.out_ckpt, raw_model, optimizer, step + 1, cfg, scaler)
+            save(cfg.out_ckpt, step + 1)
             print(f"  [ckpt] saved → {cfg.out_ckpt} (step {step})")
 
-    # --- final checkpoint ---
-    save_checkpoint(cfg.out_ckpt, raw_model, optimizer, cfg.train_steps, cfg, scaler)
+        # --- time limit: save and stop before the platform kills the session ---
+        if cfg.max_hours is not None and step % 10 == 0:
+            stop = torch.tensor([float(time.perf_counter() - run_start > cfg.max_hours * 3600)], device=device)
+            if ddp:
+                dist.broadcast(stop, 0)               # rank 0's clock decides for everyone
+            if stop.item():
+                save(cfg.out_ckpt, step + 1)
+                print(f"[pretrain] max_hours={cfg.max_hours} reached: saved step {step + 1} → "
+                      f"{cfg.out_ckpt}. Continue with --resume auto.")
+                stopped_early = True
+                break
+
+    if not stopped_early:
+        save(cfg.out_ckpt, cfg.train_steps)
+        print(f"[pretrain] done. Final checkpoint → {cfg.out_ckpt}")
     writer.close()
-    print(f"[pretrain] done. Final checkpoint → {cfg.out_ckpt}")
+    if wb is not None:
+        wb.finish()
+    if ddp:
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

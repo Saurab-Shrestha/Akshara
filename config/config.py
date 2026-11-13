@@ -135,6 +135,8 @@ class PretrainConfig(ModelConfig):
     no_wd_embed: bool = False         # v2: no weight decay on the token embedding
     z_loss: float = 0.0               # v2: 1e-5 (SmolLM3), keeps logits from drifting large
     init_ckpt: Optional[str] = None   # start from these weights (fresh optimizer/schedule), e.g. long-context stage
+    max_hours: Optional[float] = None # save and exit cleanly after this long (Kaggle: 11.5 of the 12 h limit)
+    wandb_project: Optional[str] = None  # log to Weights & Biases; the run id is kept in the checkpoint
 
     # Checkpointing
     out_ckpt: str = "checkpoints/pretrain.pt"

@@ -116,7 +116,11 @@ PYTHONPATH=. python scripts/tokenize_corpus.py --input data/corpus_anneal/train.
 # 3. pretrain (multi-session; every checkpoint backed up to Saurab0/akshara-pretrain-v2)
 PYTHONPATH=. python scripts/pretrain.py --config configs/a100_pretrain_v2.json      # A100, bf16
 #    or configs/kaggle_t4_pretrain_v2.json (T4/P100, fp16 + GradScaler). Don't mix fp16/bf16 in one run.
-#    resume: --resume checkpoints/pretrain_v2.pt
+#    resume: --resume checkpoints/pretrain_v2.pt   (or --resume auto: local file, else pull from hf_repo)
+#    Kaggle 2× T4, 12 h sessions — same command every session:
+#      torchrun --nproc_per_node 2 scripts/pretrain.py --config configs/kaggle_t4_pretrain_v2.json \
+#          --resume auto --max_hours 11.5 --wandb_project akshara
+#    (DDP splits grad_accum over the GPUs; max_hours saves and exits cleanly; W&B continues one run.)
 #    first: the comparison runs in configs/ablations/ (148M proxy, LR sweep, attention-only, AdamW)
 
 # 3b. long context 2k → 16k from the finished weights

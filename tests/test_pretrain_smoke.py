@@ -20,6 +20,7 @@ sys.path.insert(0, str(ROOT))
 
 from scripts.pretrain import decay_start, unwrap, wsd_lr  # noqa: E402
 from src.models.hybrid_decoder import HybridDecoder  # noqa: E402
+from src.checkpoint import load_checkpoint
 
 TINY = dict(vocab_size=49152, n_embed=64, n_heads=2, n_kv_heads=1, n_layers=4,
             max_seq_len=32, attn_every=4, use_fla=False, qk_norm=True, gdn_impl="native")
@@ -116,9 +117,9 @@ def test_pretrain_runs_switches_to_anneal_and_resumes(tmp_path):
     assert "switching data" in out and "anneal.bin" in out        # decay starts at step 9
     assert "[eval]" in out
 
-    ck = torch.load(ckpt, map_location="cpu", weights_only=False)
+    ck = load_checkpoint(ckpt)
     assert ck["step"] == 12
-    pre = torch.load(tmp_path / "ck_predecay_9.pt", map_location="cpu", weights_only=False)
+    pre = load_checkpoint(tmp_path / "ck_predecay_9.pt")
     assert pre["step"] == 9                                        # = decay start, before any decay step
     HybridDecoder(**TINY).load_state_dict(ck["model_state_dict"])  # plain keys, loads strictly
 
@@ -127,4 +128,35 @@ def test_pretrain_runs_switches_to_anneal_and_resumes(tmp_path):
     (tmp_path / "cfg.json").write_text(json.dumps(cfg))
     out = run("--resume", str(ckpt))
     assert "resumed from" in out and "at step 12" in out
-    assert torch.load(ckpt, map_location="cpu", weights_only=False)["step"] == 16
+    assert load_checkpoint(ckpt)["step"] == 16
+
+
+def test_ddp_two_processes_cpu_and_resume_auto(tmp_path):
+    """torchrun with 2 CPU processes (gloo): DDP training, rank-0 checkpoint,
+    max_hours stop, then --resume auto picks the checkpoint up."""
+    for name, seed in [("train.bin", 0), ("val.bin", 1)]:
+        _bin(tmp_path / name, 20_000, seed)
+    ckpt = tmp_path / "ddp.pt"
+    cfg = dict(TINY, device="cpu", tokenizer=str(ROOT / "tokenizer/akshara-bpe"),
+               train_path=str(tmp_path / "train.bin"), dev_path=str(tmp_path / "val.bin"),
+               batch_size=2, grad_accum=2, train_steps=8, warmup_steps=2, schedule="wsd",
+               optimizer="muon", lr=1e-3, min_lr=1e-4, eval_steps=4, eval_iters=1, save_every=100,
+               use_amp=False, use_gradient_checkpointing=False, compile=False,
+               out_ckpt=str(ckpt), log_dir=str(tmp_path / "logs"), hf_repo=None)
+    (tmp_path / "cfg.json").write_text(json.dumps(cfg))
+    env = {"PYTHONPATH": str(ROOT), "PATH": "/usr/bin:/bin", "OMP_NUM_THREADS": "1"}
+
+    def run(*extra):
+        r = subprocess.run([sys.executable, "-m", "torch.distributed.run", "--nproc_per_node", "2",
+                            "--master_port", "29517", "scripts/pretrain.py",
+                            "--config", str(tmp_path / "cfg.json"), *extra],
+                           cwd=ROOT, env=env, capture_output=True, text=True, timeout=600)
+        assert r.returncode == 0, r.stdout[-3000:] + r.stderr[-3000:]
+        return r.stdout
+
+    out = run("--max_hours", "0")                                  # stops at the first check (step 0)
+    assert "DDP × 2" in out and "max_hours=0.0 reached" in out
+    assert load_checkpoint(ckpt)["step"] == 1
+    out = run("--resume", "auto")
+    assert "resumed from" in out and "at step 1" in out and "done." in out
+    assert load_checkpoint(ckpt)["step"] == 8

@@ -149,6 +149,11 @@ filter against loss spikes; 0.02% of corpus_v5 val). `PackedTokenDataset`
 reads random fixed windows (`max_seq_len`, 2048 for v2) from a memmap: no
 padding, no RAM, no tokenization during training.
 
+Deduplication: the `nepali/*` sources skip exact copies of FineWeb-2 Nepali
+documents (30% of HPLT, 15% of GlotCC), and `scripts/near_dedup.py` finds
+near-duplicates with MinHash + LSH (FineWeb's settings: word 5-grams, 112
+hashes, 14 bands × 8) and writes a drop list for `tokenize_corpus.py --skip_lines`.
+
 ### Stage 3 — Pretrain v2 (`scripts/pretrain.py`)
 
 ```bash
@@ -181,7 +186,17 @@ raised mid-run when more compute appears; only the decay start moves. When the
 decay starts, the weights are also saved as `pretrain_v2_predecay_<step>.pt` (and
 pushed to HF). To extend a finished run: `--resume` from that file with a larger
 `train_steps` (e.g. a 2nd pass over corpus_v6), and it decays again at the end.
-`PYTHONPATH=. pytest -q tests/` runs the whole loop on CPU in ~15 s (also in CI).
+`PYTHONPATH=. pytest -q tests/` runs the whole loop on CPU, including 2-process
+DDP, in about a minute (also in CI).
+
+**Multi-session runs.** `--resume auto` takes `out_ckpt` if it exists, else
+downloads it from `hf_repo`, else starts fresh, so every session runs the same
+command. `--max_hours 11.5` saves and exits before Kaggle's 12 h limit.
+`torchrun --nproc_per_node 2` trains with DDP (one process per GPU, faster than
+DataParallel). `--wandb_project` logs loss, LR, grad norm, tok/s, GPU memory and
+the fp16 loss scale to W&B; the run id is stored in the checkpoint, so resumed
+sessions continue one run. Checkpoints load with `torch.load(weights_only=True)`
+(`src/checkpoint.py`); set `AKSHARA_TRUST_CHECKPOINTS=1` only for files you made.
 
 **Compute — read before starting.** 443M params ≈ 6 × 443M = 2.7 GFLOP/token.
 

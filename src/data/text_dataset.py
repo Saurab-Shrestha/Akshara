@@ -125,6 +125,7 @@ def get_text_dataloader(
     max_seq_len: int = 512,
     shuffle: bool = True,
     num_workers: int = 0,
+    distributed: bool = False,
 ) -> DataLoader:
     """
     Factory that wraps TextDataset in a DataLoader.
@@ -141,6 +142,8 @@ def get_text_dataloader(
         max_seq_len: Truncation length.
         shuffle:     Shuffle the dataset each epoch (disable for validation).
         num_workers: Parallel workers for the DataLoader.
+        distributed: DDP: each rank reads its own disjoint shard of windows
+                     (call loader.sampler.set_epoch(e) to reshuffle per epoch).
 
     Returns:
         A DataLoader that yields (input_ids, targets) batches of shape
@@ -150,10 +153,15 @@ def get_text_dataloader(
         dataset = PackedTokenDataset(path, max_seq_len=max_seq_len)
     else:
         dataset = TextDataset(path, tokenizer, max_seq_len=max_seq_len)
+    sampler = None
+    if distributed:
+        from torch.utils.data.distributed import DistributedSampler
+        sampler, shuffle = DistributedSampler(dataset, shuffle=shuffle), False
     return DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=shuffle,
+        sampler=sampler,
         num_workers=num_workers,
         drop_last=True,   # keeps all batches the same size — simplifies the training loop
     )

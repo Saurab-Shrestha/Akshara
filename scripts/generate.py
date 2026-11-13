@@ -49,6 +49,7 @@ import torch
 from PIL import Image
 
 from src.data.ocr_dataset import pad_to_square
+from src.checkpoint import load_checkpoint
 
 # ImageNet normalisation — must match the training preprocessing in ocr_dataset.py.
 _IMAGENET_MEAN = [0.485, 0.456, 0.406]
@@ -155,7 +156,7 @@ def main() -> None:
         sys.exit(1)
 
     # --- load checkpoint ---
-    ck = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+    ck = load_checkpoint(args.checkpoint)
     saved_config = ck.get("config", {})
 
     device = args.device or saved_config.get("device", "cpu")

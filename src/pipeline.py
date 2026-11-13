@@ -32,6 +32,7 @@ from PIL import Image
 
 from src.data.ocr_dataset import pad_to_square, _IMAGENET_MEAN, _IMAGENET_STD
 from src.models.vlm import Akshara
+from src.checkpoint import load_checkpoint
 
 # Surya layout labels → HTML tags. Unlisted labels (PageFooter, Picture…) are skipped.
 _TAG = {
@@ -50,7 +51,7 @@ class AksharaPipeline:
         self.device     = device
         self.batch_size = batch_size
 
-        ck  = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        ck  = load_checkpoint(ckpt_path)
         cfg = ck.get("config")
         if cfg is None:
             raise ValueError(f"{ckpt_path} has no embedded config — cannot build model")

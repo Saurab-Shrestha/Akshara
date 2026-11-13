@@ -14,6 +14,7 @@ import torch
 from transformers import AutoTokenizer
 
 from src.models.hybrid_decoder import HybridDecoder
+from src.checkpoint import load_checkpoint
 
 PROMPTS = [
     "नेपालको राजधानी",
@@ -25,7 +26,7 @@ PROMPTS = [
 
 
 def load(ckpt_path, device):
-    ck = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    ck = load_checkpoint(ckpt_path)
     c = ck["config"]
     model = HybridDecoder(
         vocab_size=c["vocab_size"], n_embed=c["n_embed"], n_heads=c["n_heads"],
